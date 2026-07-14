@@ -17,6 +17,27 @@ type recordingDialer struct {
 	dialer  net.Dialer
 }
 
+type blockingDialer struct {
+	mu   sync.Mutex
+	peer net.Conn
+}
+
+func (d *blockingDialer) DialContext(context.Context, string, string) (net.Conn, error) {
+	proxySide, peer := net.Pipe()
+	d.mu.Lock()
+	d.peer = peer
+	d.mu.Unlock()
+	return proxySide, nil
+}
+
+func (d *blockingDialer) close() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.peer != nil {
+		d.peer.Close()
+	}
+}
+
 func (d *recordingDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	d.mu.Lock()
 	d.targets = append(d.targets, address)
@@ -148,6 +169,57 @@ func TestServerRejectsUnsupportedAuthentication(t *testing.T) {
 	}
 	if err := <-done; err == nil {
 		t.Fatal("negotiate() 意外成功，期望拒绝请求")
+	}
+}
+
+func TestServerShutdownClosesRemoteTunnel(t *testing.T) {
+	proxyListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialer := &blockingDialer{}
+	defer dialer.close()
+	server, err := New("127.0.0.1:1080", 2*time.Second, dialer, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(ctx, proxyListener) }()
+
+	client, err := net.Dial("tcp", proxyListener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if _, err := client.Write([]byte{version5, 1, methodNoAuth}); err != nil {
+		t.Fatal(err)
+	}
+	response := make([]byte, 2)
+	if _, err := io.ReadFull(client, response); err != nil {
+		t.Fatal(err)
+	}
+	request := []byte{version5, commandConnect, 0, addressIPv4, 127, 0, 0, 1, 0, 80}
+	if _, err := client.Write(request); err != nil {
+		t.Fatal(err)
+	}
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(client, reply); err != nil {
+		t.Fatal(err)
+	}
+	if reply[1] != replySucceeded {
+		t.Fatalf("CONNECT 响应码为 %d", reply[1])
+	}
+
+	// 远端保持连接且不发送任何数据，模拟浏览器中的长期空闲连接。
+	cancel()
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("Serve() 返回错误：%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("远端保持连接时，SOCKS5 服务退出超时")
 	}
 }
 

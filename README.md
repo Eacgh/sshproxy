@@ -31,6 +31,12 @@ Copy-Item config.example.json config.json
 go run ./cmd/sshvpn -config config.json
 ```
 
+运行期间按 `Ctrl+C` 会关闭所有本地连接和 SSH 通道后正常退出。默认只显示连接状态；需要查看每条 SOCKS5 连接时使用：
+
+```powershell
+go run ./cmd/sshvpn -config config.json -verbose
+```
+
 另一个终端使用 `curl` 验证出口 IP：
 
 ```powershell

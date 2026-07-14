@@ -43,11 +43,11 @@ type Server struct {
 	dialer      Dialer
 	logger      *slog.Logger
 
-	mu       sync.Mutex
-	listener net.Listener
-	clients  map[net.Conn]struct{}
-	closed   bool
-	wg       sync.WaitGroup
+	mu          sync.Mutex
+	listener    net.Listener
+	connections map[net.Conn]struct{}
+	closed      bool
+	wg          sync.WaitGroup
 }
 
 // New 创建只允许绑定到本机回环地址的 SOCKS5 服务。
@@ -66,7 +66,7 @@ func New(listenAddr string, dialTimeout time.Duration, dialer Dialer, logger *sl
 	}
 	return &Server{
 		listenAddr: listenAddr, dialTimeout: dialTimeout, dialer: dialer,
-		logger: logger, clients: make(map[net.Conn]struct{}),
+		logger: logger, connections: make(map[net.Conn]struct{}),
 	}, nil
 }
 
@@ -108,7 +108,7 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	s.listener = listener
 	s.mu.Unlock()
 
-	s.logger.Info("SOCKS5 代理已开始监听", "地址", listener.Addr().String())
+	s.logger.Info("SOCKS5 代理已开始监听；按 Ctrl+C 可退出，使用 -verbose 查看连接详情", "地址", listener.Addr().String())
 	go func() {
 		<-ctx.Done()
 		s.Close()
@@ -140,17 +140,32 @@ func (s *Server) track(conn net.Conn) bool {
 	if s.closed {
 		return false
 	}
-	s.clients[conn] = struct{}{}
+	s.connections[conn] = struct{}{}
 	s.wg.Add(1)
 	return true
+}
+
+// trackRemote 把 SSH 远端通道纳入关闭流程，防止长连接阻塞程序退出。
+func (s *Server) trackRemote(conn net.Conn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return false
+	}
+	s.connections[conn] = struct{}{}
+	return true
+}
+
+func (s *Server) untrack(conn net.Conn) {
+	s.mu.Lock()
+	delete(s.connections, conn)
+	s.mu.Unlock()
 }
 
 func (s *Server) handle(client net.Conn) {
 	defer s.wg.Done()
 	defer func() {
-		s.mu.Lock()
-		delete(s.clients, client)
-		s.mu.Unlock()
+		s.untrack(client)
 		client.Close()
 	}()
 
@@ -179,7 +194,14 @@ func (s *Server) handle(client net.Conn) {
 		s.logger.Debug("SOCKS5 目标连接失败", "目标", target, "错误", err)
 		return
 	}
-	defer remote.Close()
+	if !s.trackRemote(remote) {
+		remote.Close()
+		return
+	}
+	defer func() {
+		s.untrack(remote)
+		remote.Close()
+	}()
 	if err := writeReply(client, replySucceeded); err != nil {
 		return
 	}
@@ -313,7 +335,7 @@ func proxy(client, remote net.Conn) {
 	<-done
 }
 
-// Close 停止监听并关闭所有仍在处理的客户端连接。
+// Close 停止监听，同时关闭客户端和 SSH 远端连接，并等待处理协程退出。
 func (s *Server) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -322,17 +344,19 @@ func (s *Server) Close() error {
 	}
 	s.closed = true
 	listener := s.listener
-	clients := make([]net.Conn, 0, len(s.clients))
-	for client := range s.clients {
-		clients = append(clients, client)
+	connections := make([]net.Conn, 0, len(s.connections))
+	for connection := range s.connections {
+		connections = append(connections, connection)
 	}
 	s.mu.Unlock()
 
+	s.logger.Info("正在停止 SOCKS5 代理", "待关闭连接数", len(connections))
 	if listener != nil {
 		listener.Close()
 	}
-	for _, client := range clients {
-		client.Close()
+	for _, connection := range connections {
+		connection.Close()
 	}
+	s.wg.Wait()
 	return nil
 }
