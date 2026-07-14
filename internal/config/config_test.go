@@ -43,6 +43,37 @@ func TestLoadAcceptsCustomPorts(t *testing.T) {
 	}
 }
 
+func TestLoadAcceptsCustomDNS(t *testing.T) {
+	path := writeConfig(t, `{
+		"server_address": "ssh.example.com",
+		"username": "alice",
+		"password": "secret",
+		"dns_server": "9.9.9.9"
+	}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() 返回错误：%v", err)
+	}
+	if cfg.CustomDNSServer() != "9.9.9.9:53" {
+		t.Fatalf("自定义 DNS 为 %q", cfg.CustomDNSServer())
+	}
+}
+
+func TestLoadRejectsDNSHostname(t *testing.T) {
+	path := writeConfig(t, `{
+		"server_address": "ssh.example.com",
+		"username": "alice",
+		"password": "secret",
+		"dns_server": "dns.example.com"
+	}`)
+
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "dns_server") {
+		t.Fatalf("Load() 返回错误：%v，期望 DNS 地址校验错误", err)
+	}
+}
+
 func TestLoadRejectsInvalidProxyPort(t *testing.T) {
 	path := writeConfig(t, `{
 		"server_address": "ssh.example.com",

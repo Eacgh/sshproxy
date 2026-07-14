@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -63,6 +64,28 @@ func TestManagerDialsThroughSSHDirectTCPIP(t *testing.T) {
 	}
 	if string(got) != string(payload) {
 		t.Fatalf("收到 %q，期望 %q", got, payload)
+	}
+}
+
+func TestTargetDialStateIsRemovedAfterUse(t *testing.T) {
+	manager := &Manager{
+		done:    make(chan struct{}),
+		targets: make(map[string]*targetDialState),
+	}
+	release, err := manager.acquireTargetDial(context.Background(), "example.com:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := manager.acquireTargetDial(ctx, "example.com:443"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("等待同目标名额返回 %v", err)
+	}
+	release()
+	manager.dialMu.Lock()
+	defer manager.dialMu.Unlock()
+	if len(manager.targets) != 0 {
+		t.Fatalf("已结束目标仍保留在限流表中：%d", len(manager.targets))
 	}
 }
 

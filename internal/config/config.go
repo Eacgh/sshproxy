@@ -20,13 +20,14 @@ const (
 	loopbackListenHost = "127.0.0.1"
 )
 
-// Config 只包含普通用户需要填写的四项连接信息。
+// Config 包含连接信息和可选的自定义 DNS。
 // 监听地址、超时、保活和主机密钥存储均由程序内部管理。
 type Config struct {
 	ServerAddress string `json:"server_address"`
 	Username      string `json:"username"`
 	Password      string `json:"password"`
 	ProxyPort     int    `json:"proxy_port"`
+	DNSServer     string `json:"dns_server,omitempty"`
 }
 
 // Load 读取 JSON 配置，补全默认端口并执行完整校验。
@@ -90,6 +91,7 @@ func describeJSONError(err error) error {
 func (c *Config) applyDefaults() error {
 	c.ServerAddress = strings.TrimSpace(c.ServerAddress)
 	c.Username = strings.TrimSpace(c.Username)
+	c.DNSServer = strings.TrimSpace(c.DNSServer)
 	if c.ProxyPort == 0 {
 		c.ProxyPort = defaultProxyPort
 	}
@@ -99,7 +101,31 @@ func (c *Config) applyDefaults() error {
 		return err
 	}
 	c.ServerAddress = address
+	if c.DNSServer != "" {
+		dnsAddress, err := normalizeDNSAddress(c.DNSServer)
+		if err != nil {
+			return err
+		}
+		c.DNSServer = dnsAddress
+	}
 	return nil
+}
+
+// normalizeDNSAddress 只接受 IP，避免解析 DNS 服务器本身时产生启动依赖。
+// 未填写端口时自动使用标准 TCP/53。
+func normalizeDNSAddress(address string) (string, error) {
+	if ip := net.ParseIP(strings.Trim(address, "[]")); ip != nil {
+		return net.JoinHostPort(ip.String(), "53"), nil
+	}
+	host, portText, err := net.SplitHostPort(address)
+	if err != nil || net.ParseIP(strings.Trim(host, "[]")) == nil {
+		return "", errors.New("dns_server 必须是 IP 或 IP:端口")
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return "", errors.New("dns_server 端口必须在 1 到 65535 之间")
+	}
+	return net.JoinHostPort(strings.Trim(host, "[]"), strconv.Itoa(port)), nil
 }
 
 // normalizeServerAddress 在用户没有填写 SSH 端口时自动补充 22。
@@ -129,7 +155,7 @@ func normalizeServerAddress(address string) (string, error) {
 	return net.JoinHostPort(address, strconv.Itoa(defaultSSHPort)), nil
 }
 
-// Validate 校验四项用户配置，内部设置无需用户参与。
+// Validate 校验用户配置，内部设置无需用户参与。
 func (c Config) Validate() error {
 	if _, _, err := net.SplitHostPort(c.ServerAddress); err != nil {
 		return errors.New("server_address 格式无效")
@@ -143,7 +169,18 @@ func (c Config) Validate() error {
 	if c.ProxyPort < 1 || c.ProxyPort > 65535 {
 		return errors.New("proxy_port 必须在 1 到 65535 之间")
 	}
+	if c.DNSServer != "" {
+		host, _, err := net.SplitHostPort(c.DNSServer)
+		if err != nil || net.ParseIP(host) == nil {
+			return errors.New("dns_server 格式无效")
+		}
+	}
 	return nil
+}
+
+// CustomDNSServer 返回通过 SSH 访问的自定义 DNS；空值表示使用本地 Fake-IP。
+func (c Config) CustomDNSServer() string {
+	return c.DNSServer
 }
 
 // SSHAddress 返回包含端口的 SSH 服务器地址。

@@ -25,6 +25,18 @@ var (
 	knownHostsMu  sync.Mutex
 )
 
+// SSH 协议没有取消单个 direct-tcpip 开通请求的机制。这里限制真正仍在等待
+// 服务端响应的请求数量，避免大量不可达目标耗尽协程和 SSH 多路复用资源。
+const (
+	maxPendingSSHDials       = 24
+	maxPendingSSHToOneTarget = 1
+)
+
+type targetDialState struct {
+	slots chan struct{}
+	users int
+}
+
 // Manager 维护一个可复用的 SSH 连接，并在连接失效后按需重建。
 type Manager struct {
 	cfg       config.Config
@@ -35,8 +47,13 @@ type Manager struct {
 	connectMu sync.Mutex
 	client    *ssh.Client
 	raw       net.Conn
+	dialAddr  string
+	serverIP  net.IP
 	closed    bool
 	done      chan struct{}
+	dialSlots chan struct{}
+	dialMu    sync.Mutex
+	targets   map[string]*targetDialState
 	wg        sync.WaitGroup
 }
 
@@ -49,7 +66,14 @@ func NewManager(cfg config.Config, logger *slog.Logger) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Manager{cfg: cfg, sshConfig: sshConfig, logger: logger, done: make(chan struct{})}, nil
+	return &Manager{
+		cfg:       cfg,
+		sshConfig: sshConfig,
+		logger:    logger,
+		done:      make(chan struct{}),
+		dialSlots: make(chan struct{}, maxPendingSSHDials),
+		targets:   make(map[string]*targetDialState),
+	}, nil
 }
 
 func buildClientConfig(cfg config.Config, logger *slog.Logger) (*ssh.ClientConfig, error) {
@@ -142,9 +166,10 @@ func (m *Manager) ensureConnected(ctx context.Context) (*ssh.Client, error) {
 	}
 
 	address := m.cfg.SSHAddress()
+	dialAddress := m.cachedDialAddress(address)
 	m.logger.Info("正在连接 SSH 服务器", "地址", address, "用户", m.cfg.Username)
 	dialer := net.Dialer{Timeout: m.cfg.ConnectTimeout()}
-	raw, err := dialer.DialContext(ctx, "tcp", address)
+	raw, err := dialer.DialContext(ctx, "tcp", dialAddress)
 	if err != nil {
 		return nil, fmt.Errorf("连接 SSH 服务器失败：%w", err)
 	}
@@ -174,12 +199,37 @@ func (m *Manager) ensureConnected(ctx context.Context) (*ssh.Client, error) {
 	}
 	m.client = client
 	m.raw = raw
+	// 第一次连接后固定实际服务器 IP。全局路由启用后即使 SSH 断线，
+	// 重连也不依赖可能需要当前 SSH 通道才能工作的系统 DNS。
+	if tcpAddress, ok := raw.RemoteAddr().(*net.TCPAddr); ok {
+		m.serverIP = append(net.IP(nil), tcpAddress.IP...)
+		m.dialAddr = net.JoinHostPort(tcpAddress.IP.String(), fmt.Sprint(tcpAddress.Port))
+	}
 	m.mu.Unlock()
 
 	m.logger.Info("SSH 连接已建立", "地址", address)
 	m.wg.Add(1)
 	go m.keepalive(client)
 	return client, nil
+}
+
+func (m *Manager) cachedDialAddress(fallback string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.dialAddr != "" {
+		return m.dialAddr
+	}
+	return fallback
+}
+
+// ServerIP 返回当前 SSH TCP 连接实际使用的服务器 IP，供全局模式添加直连路由。
+func (m *Manager) ServerIP() (net.IP, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if len(m.serverIP) == 0 {
+		return nil, errors.New("SSH 连接尚未提供服务器 IP")
+	}
+	return append(net.IP(nil), m.serverIP...), nil
 }
 
 func (m *Manager) currentClient() *ssh.Client {
@@ -194,18 +244,40 @@ func (m *Manager) DialContext(ctx context.Context, network, address string) (net
 	if err != nil {
 		return nil, err
 	}
+	releaseTarget, err := m.acquireTargetDial(ctx, address)
+	if err != nil {
+		return nil, err
+	}
+	select {
+	case m.dialSlots <- struct{}{}:
+	case <-ctx.Done():
+		releaseTarget()
+		return nil, ctx.Err()
+	case <-m.done:
+		releaseTarget()
+		return nil, net.ErrClosed
+	}
 
 	type result struct {
 		conn net.Conn
 		err  error
 	}
-	resultCh := make(chan result, 1)
-	// ssh.Client.Dial 不接收 context，用独立协程把取消信号转换为调用方超时。
+	// 使用无缓冲通道很重要：调用方超时返回后，后台稍晚建立的连接只能走
+	// ctx.Done 分支并被关闭，不能遗留在无人接收的缓冲通道里。
+	resultCh := make(chan result)
 	go func() {
+		defer func() {
+			<-m.dialSlots
+			releaseTarget()
+		}()
 		conn, err := client.Dial(network, address)
 		select {
 		case resultCh <- result{conn: conn, err: err}:
 		case <-ctx.Done():
+			if conn != nil {
+				conn.Close()
+			}
+		case <-m.done:
 			if conn != nil {
 				conn.Close()
 			}
@@ -215,12 +287,48 @@ func (m *Manager) DialContext(ctx context.Context, network, address string) (net
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	case <-m.done:
+		return nil, net.ErrClosed
 	case result := <-resultCh:
 		if result.err != nil && isTransportClosed(result.err) {
 			m.invalidate(client, result.err)
 		}
 		return result.conn, result.err
 	}
+}
+
+func (m *Manager) acquireTargetDial(ctx context.Context, address string) (func(), error) {
+	m.dialMu.Lock()
+	state := m.targets[address]
+	if state == nil {
+		state = &targetDialState{slots: make(chan struct{}, maxPendingSSHToOneTarget)}
+		m.targets[address] = state
+	}
+	state.users++
+	m.dialMu.Unlock()
+
+	select {
+	case state.slots <- struct{}{}:
+		return func() {
+			<-state.slots
+			m.releaseTargetDial(address, state)
+		}, nil
+	case <-ctx.Done():
+		m.releaseTargetDial(address, state)
+		return nil, ctx.Err()
+	case <-m.done:
+		m.releaseTargetDial(address, state)
+		return nil, net.ErrClosed
+	}
+}
+
+func (m *Manager) releaseTargetDial(address string, state *targetDialState) {
+	m.dialMu.Lock()
+	state.users--
+	if state.users == 0 && m.targets[address] == state {
+		delete(m.targets, address)
+	}
+	m.dialMu.Unlock()
 }
 
 func isTransportClosed(err error) bool {

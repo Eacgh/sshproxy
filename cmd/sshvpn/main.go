@@ -16,6 +16,7 @@ import (
 	"syscall"
 
 	"sshvpn/internal/config"
+	"sshvpn/internal/globalproxy"
 	"sshvpn/internal/portable"
 	"sshvpn/internal/socks5"
 	"sshvpn/internal/sshclient"
@@ -36,6 +37,7 @@ func run() error {
 	configPath := flag.String("config", defaultConfigPath, "JSON 配置文件路径")
 	verbose := flag.Bool("verbose", false, "显示调试日志")
 	controlStdin := flag.Bool("control-stdin", false, "允许 GUI 通过标准输入停止程序")
+	globalMode := flag.Bool("global", false, "启用 Windows 全局 TCP 代理")
 	configureUsage()
 	flag.Parse()
 
@@ -47,6 +49,11 @@ func run() error {
 		Level:       level,
 		ReplaceAttr: localizeLogAttribute,
 	}))
+	if *globalMode {
+		if err := globalproxy.Recover(logger); err != nil {
+			return err
+		}
+	}
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -77,8 +84,40 @@ func run() error {
 		return err
 	}
 	defer server.Close()
-	if err := server.ListenAndServe(ctx); err != nil && !errors.Is(err, net.ErrClosed) {
-		return err
+	listener, err := net.Listen("tcp", cfg.SOCKSListen())
+	if err != nil {
+		return fmt.Errorf("监听 SOCKS5 连接失败：%w", err)
+	}
+
+	var globalController globalproxy.Controller
+	if *globalMode {
+		serverIP, err := manager.ServerIP()
+		if err != nil {
+			listener.Close()
+			return err
+		}
+		globalController = globalproxy.New(globalproxy.Options{
+			SSHServerIP: serverIP,
+			Dialer:      manager,
+			DNSServer:   cfg.CustomDNSServer(),
+			Logger:      logger,
+		})
+		if err := globalController.Start(ctx); err != nil {
+			listener.Close()
+			return err
+		}
+	}
+
+	serveErr := server.Serve(ctx, listener)
+	var cleanupErr error
+	if globalController != nil {
+		cleanupErr = globalController.Close()
+	}
+	if serveErr != nil && !errors.Is(serveErr, net.ErrClosed) {
+		return serveErr
+	}
+	if cleanupErr != nil {
+		return cleanupErr
 	}
 	logger.Info("sshvpn 已停止")
 	return nil
@@ -112,6 +151,8 @@ func configureUsage() {
 		fmt.Fprintln(output, "        显示调试日志")
 		fmt.Fprintln(output, "  -control-stdin")
 		fmt.Fprintln(output, "        允许 GUI 通过标准输入停止程序")
+		fmt.Fprintln(output, "  -global")
+		fmt.Fprintln(output, "        启用 Windows 全局 TCP 代理（需要管理员权限）")
 	}
 }
 

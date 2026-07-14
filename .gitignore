@@ -9,4 +9,8 @@
 config.json.tmp
 known_hosts
 sshvpn-core.exe.tmp
+/wintun.dll
+wintun.dll.tmp
+/network-state.json
+network-state.json.tmp
 *.log
