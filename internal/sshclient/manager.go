@@ -17,10 +17,11 @@ import (
 	"golang.org/x/crypto/ssh/knownhosts"
 
 	"sshvpn/internal/config"
+	"sshvpn/internal/portable"
 )
 
 var (
-	userConfigDir = os.UserConfigDir
+	dataDirectory = portable.Directory
 	knownHostsMu  sync.Mutex
 )
 
@@ -65,15 +66,11 @@ func buildClientConfig(cfg config.Config, logger *slog.Logger) (*ssh.ClientConfi
 
 // buildHostKeyCallback 使用首次信任机制自动维护应用自己的 known_hosts 文件。
 func buildHostKeyCallback(logger *slog.Logger) (ssh.HostKeyCallback, error) {
-	baseDir, err := userConfigDir()
+	baseDir, err := dataDirectory()
 	if err != nil {
-		return nil, fmt.Errorf("确定程序配置目录失败：%w", err)
+		return nil, fmt.Errorf("确定便携数据目录失败：%w", err)
 	}
-	appDir := filepath.Join(baseDir, "sshvpn")
-	if err := os.MkdirAll(appDir, 0o700); err != nil {
-		return nil, fmt.Errorf("创建程序配置目录失败：%w", err)
-	}
-	knownHostsPath := filepath.Join(appDir, "known_hosts")
+	knownHostsPath := filepath.Join(baseDir, "known_hosts")
 	file, err := os.OpenFile(knownHostsPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("创建 SSH 主机密钥数据库失败：%w", err)

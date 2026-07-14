@@ -1,18 +1,22 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"sshvpn/internal/config"
+	"sshvpn/internal/portable"
 	"sshvpn/internal/socks5"
 	"sshvpn/internal/sshclient"
 )
@@ -25,8 +29,13 @@ func main() {
 }
 
 func run() error {
-	configPath := flag.String("config", "config.json", "JSON 配置文件路径")
+	defaultConfigPath, err := portable.File("config.json")
+	if err != nil {
+		return err
+	}
+	configPath := flag.String("config", defaultConfigPath, "JSON 配置文件路径")
 	verbose := flag.Bool("verbose", false, "显示调试日志")
+	controlStdin := flag.Bool("control-stdin", false, "允许 GUI 通过标准输入停止程序")
 	configureUsage()
 	flag.Parse()
 
@@ -49,8 +58,13 @@ func run() error {
 	}
 	defer manager.Close()
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	signalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	ctx, cancelRun := context.WithCancel(signalCtx)
+	defer cancelRun()
+	if *controlStdin {
+		go watchControlInput(os.Stdin, cancelRun, logger)
+	}
 	connectCtx, cancel := context.WithTimeout(ctx, cfg.ConnectTimeout())
 	err = manager.Connect(connectCtx)
 	cancel()
@@ -70,6 +84,22 @@ func run() error {
 	return nil
 }
 
+// watchControlInput 接收 GUI 发来的 stop 命令，并触发与 Ctrl+C 相同的清理流程。
+func watchControlInput(reader io.Reader, cancel context.CancelFunc, logger *slog.Logger) {
+	scanner := bufio.NewScanner(reader)
+	for scanner.Scan() {
+		command := strings.ToLower(strings.TrimSpace(scanner.Text()))
+		if command == "stop" || command == "exit" || command == "quit" {
+			logger.Info("收到 GUI 退出命令")
+			cancel()
+			return
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		logger.Warn("读取 GUI 控制命令失败", "错误", err)
+	}
+}
+
 // configureUsage 用中文输出命令行帮助，避免标准 flag 帮助混入英文标题。
 func configureUsage() {
 	flag.Usage = func() {
@@ -80,6 +110,8 @@ func configureUsage() {
 		fmt.Fprintln(output, "        JSON 配置文件路径（默认：config.json）")
 		fmt.Fprintln(output, "  -verbose")
 		fmt.Fprintln(output, "        显示调试日志")
+		fmt.Fprintln(output, "  -control-stdin")
+		fmt.Fprintln(output, "        允许 GUI 通过标准输入停止程序")
 	}
 }
 

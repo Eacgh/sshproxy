@@ -21,7 +21,7 @@ import (
 )
 
 func TestManagerDialsThroughSSHDirectTCPIP(t *testing.T) {
-	configRoot := useTemporaryConfigDir(t)
+	configRoot := useTemporaryDataDirectory(t)
 	target := startEchoServer(t)
 	sshAddress := startSSHServer(t, "test-password")
 
@@ -43,7 +43,7 @@ func TestManagerDialsThroughSSHDirectTCPIP(t *testing.T) {
 	if err := manager.Connect(ctx); err != nil {
 		t.Fatalf("Connect() 返回错误：%v", err)
 	}
-	knownHosts, err := os.ReadFile(filepath.Join(configRoot, "sshvpn", "known_hosts"))
+	knownHosts, err := os.ReadFile(filepath.Join(configRoot, "known_hosts"))
 	if err != nil || len(knownHosts) == 0 {
 		t.Fatalf("首次连接没有自动保存主机密钥：%v", err)
 	}
@@ -67,7 +67,7 @@ func TestManagerDialsThroughSSHDirectTCPIP(t *testing.T) {
 }
 
 func TestHostKeyChangeIsRejected(t *testing.T) {
-	useTemporaryConfigDir(t)
+	useTemporaryDataDirectory(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	callback, err := buildHostKeyCallback(logger)
 	if err != nil {
@@ -84,12 +84,12 @@ func TestHostKeyChangeIsRejected(t *testing.T) {
 	}
 }
 
-func useTemporaryConfigDir(t *testing.T) string {
+func useTemporaryDataDirectory(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
-	previous := userConfigDir
-	userConfigDir = func() (string, error) { return root, nil }
-	t.Cleanup(func() { userConfigDir = previous })
+	previous := dataDirectory
+	dataDirectory = func() (string, error) { return root, nil }
+	t.Cleanup(func() { dataDirectory = previous })
 	return root
 }
 
