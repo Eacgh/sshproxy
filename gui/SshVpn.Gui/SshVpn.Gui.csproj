@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>SshVpn</AssemblyName>
+    <RootNamespace>SshVpn.Gui</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <RepositoryRoot>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\..\..'))</RepositoryRoot>
+    <RestorePackagesPath>$(RepositoryRoot)\.cache\nuget</RestorePackagesPath>
+    <NuGetAudit>false</NuGetAudit>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Resources\sshvpn-core.exe" LogicalName="SshVpn.Embedded.sshvpn-core.exe" />
+  </ItemGroup>
+
+  <Target Name="EnsureEmbeddedCore" BeforeTargets="PrepareForBuild">
+    <Error Condition="!Exists('$(MSBuildProjectDirectory)\Resources\sshvpn-core.exe')"
+           Text="缺少待嵌入的 Go 核心。请先执行 README 中的 go build 命令。" />
+  </Target>
+</Project>
