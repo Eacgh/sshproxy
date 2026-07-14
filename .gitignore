@@ -1,5 +1,12 @@
 /bin/
 /.cache/
+/artifacts/
+/gui/**/bin/
+/gui/**/obj/
+/gui/SshVpn.Gui/Resources/sshvpn-core.exe
 /sshvpn.exe
 /config.json
+config.json.tmp
+known_hosts
+sshvpn-core.exe.tmp
 *.log
