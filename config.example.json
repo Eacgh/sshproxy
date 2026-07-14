@@ -1,0 +1,6 @@
+{
+  "server_address": "ssh.example.com",
+  "username": "你的用户名",
+  "password": "你的密码",
+  "proxy_port": 1080
+}

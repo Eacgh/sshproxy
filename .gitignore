@@ -1,0 +1,5 @@
+/bin/
+/.cache/
+/sshvpn.exe
+/config.json
+*.log
