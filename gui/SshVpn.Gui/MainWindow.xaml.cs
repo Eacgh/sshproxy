@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
+using System.Net;
 using System.Windows;
 using System.Windows.Media;
 using SshVpn.Gui.Models;
@@ -19,6 +20,7 @@ public partial class MainWindow : Window
     private readonly Forms.NotifyIcon _trayIcon;
     private readonly Forms.ToolStripMenuItem _trayToggleItem;
     private bool _syncingPassword;
+    private bool _exitRequested;
     private bool _allowClose;
     private bool _closing;
     private bool _windowLoaded;
@@ -37,7 +39,7 @@ public partial class MainWindow : Window
         trayMenu.Items.Add("显示窗口", null, (_, _) => Dispatcher.Invoke(ShowFromTray));
         trayMenu.Items.Add(_trayToggleItem);
         trayMenu.Items.Add(new Forms.ToolStripSeparator());
-        trayMenu.Items.Add("退出", null, (_, _) => Dispatcher.Invoke(Close));
+        trayMenu.Items.Add("退出", null, (_, _) => Dispatcher.Invoke(RequestExit));
         _trayIcon = new Forms.NotifyIcon
         {
             Icon = DrawingSystemIcons.Shield,
@@ -65,7 +67,8 @@ public partial class MainWindow : Window
             UsernameBox.Text = config.Username;
             PasswordInput.Password = config.Password;
             ProxyPortBox.Text = config.ProxyPort.ToString();
-            EndpointText.Text = $"SOCKS5 127.0.0.1:{config.ProxyPort}";
+            DnsServerBox.Text = config.DnsServer ?? string.Empty;
+            UpdateEndpointText(config.ProxyPort);
             AddLog(File.Exists(_paths.ConfigPath) ? "已读取同目录配置" : "尚未创建配置文件");
         }
         catch (Exception ex)
@@ -103,7 +106,7 @@ public partial class MainWindow : Window
             {
                 return;
             }
-            await _coreService.StartAsync();
+            await _coreService.StartAsync(GlobalModeCheckBox.IsChecked == true);
         }
         catch (Exception ex)
         {
@@ -138,18 +141,34 @@ public partial class MainWindow : Window
             ShowValidation("代理端口必须在 1 到 65535 之间");
             return false;
         }
+        var dnsServer = DnsServerBox.Text.Trim();
+        if (!IsValidDnsServer(dnsServer))
+        {
+            ShowValidation("自定义 DNS 必须填写 IP 或 IP:端口；留空则使用 Fake-IP");
+            return false;
+        }
 
         var config = new AppConfig
         {
             ServerAddress = ServerAddressBox.Text.Trim(),
             Username = UsernameBox.Text.Trim(),
             Password = password,
-            ProxyPort = proxyPort
+            ProxyPort = proxyPort,
+            DnsServer = string.IsNullOrEmpty(dnsServer) ? null : dnsServer
         };
         await _configService.SaveAsync(config);
-        EndpointText.Text = $"SOCKS5 127.0.0.1:{proxyPort}";
+        UpdateEndpointText(proxyPort);
         AddLog("配置已保存到程序目录");
         return true;
+    }
+
+    private static bool IsValidDnsServer(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value) || IPAddress.TryParse(value.Trim('[', ']'), out _))
+        {
+            return true;
+        }
+        return IPEndPoint.TryParse(value, out var endpoint) && endpoint.Port is >= 1 and <= 65535;
     }
 
     private void CoreService_LogReceived(object? sender, string message)
@@ -167,7 +186,8 @@ public partial class MainWindow : Window
         var (text, color) = state switch
         {
             CoreState.Starting => ("正在连接", "#D97706"),
-            CoreState.Connected => ("已连接", "#07835C"),
+            CoreState.Connected when _coreService.GlobalMode => ("已连接（全局 TCP）", "#07835C"),
+            CoreState.Connected => ("已连接（SOCKS5）", "#07835C"),
             CoreState.Stopping => ("正在断开", "#D97706"),
             CoreState.Faulted => ("连接失败", "#B42318"),
             _ => ("未连接", "#8A969C")
@@ -182,7 +202,9 @@ public partial class MainWindow : Window
         PasswordInput.IsEnabled = !running;
         VisiblePasswordInput.IsEnabled = !running;
         ProxyPortBox.IsEnabled = !running;
+        DnsServerBox.IsEnabled = !running;
         ShowPasswordCheckBox.IsEnabled = !running;
+        GlobalModeCheckBox.IsEnabled = !running;
         SaveButton.IsEnabled = !running;
         ConnectButton.IsEnabled = state != CoreState.Stopping;
 
@@ -195,6 +217,13 @@ public partial class MainWindow : Window
             ShowValidation("连接失败，详细原因已显示在日志页");
             MainTabs.SelectedItem = LogTab;
         }
+    }
+
+    private void UpdateEndpointText(int proxyPort)
+    {
+        EndpointText.Text = GlobalModeCheckBox.IsChecked == true
+            ? $"全局 TCP · SOCKS5 127.0.0.1:{proxyPort}"
+            : $"SOCKS5 127.0.0.1:{proxyPort}";
     }
 
     private void AddLog(string message)
@@ -323,6 +352,12 @@ public partial class MainWindow : Window
         Activate();
     }
 
+    private void RequestExit()
+    {
+        _exitRequested = true;
+        Close();
+    }
+
     private async void Window_Closing(object? sender, CancelEventArgs e)
     {
         if (_allowClose)
@@ -330,6 +365,11 @@ public partial class MainWindow : Window
             return;
         }
         e.Cancel = true;
+        if (!_exitRequested)
+        {
+            Hide();
+            return;
+        }
         if (_closing)
         {
             return;

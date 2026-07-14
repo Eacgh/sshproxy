@@ -18,14 +18,17 @@ internal sealed class CoreProcessService(PortablePaths paths) : IAsyncDisposable
     private readonly SemaphoreSlim _gate = new(1, 1);
     private Process? _process;
     private bool _intentionalStop;
+    private bool _globalMode;
 
     public CoreState State { get; private set; } = CoreState.Stopped;
+
+    public bool GlobalMode => _globalMode;
 
     public event EventHandler<string>? LogReceived;
 
     public event EventHandler<CoreState>? StateChanged;
 
-    public async Task StartAsync()
+    public async Task StartAsync(bool globalMode)
     {
         await _gate.WaitAsync();
         try
@@ -55,6 +58,10 @@ internal sealed class CoreProcessService(PortablePaths paths) : IAsyncDisposable
             startInfo.ArgumentList.Add(paths.ConfigPath);
             startInfo.ArgumentList.Add("-verbose");
             startInfo.ArgumentList.Add("-control-stdin");
+            if (globalMode)
+            {
+                startInfo.ArgumentList.Add("-global");
+            }
 
             var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
             process.OutputDataReceived += HandleOutput;
@@ -62,6 +69,7 @@ internal sealed class CoreProcessService(PortablePaths paths) : IAsyncDisposable
             process.Exited += HandleExited;
 
             _intentionalStop = false;
+            _globalMode = globalMode;
             _process = process;
             SetState(CoreState.Starting);
             if (!process.Start())
@@ -124,7 +132,8 @@ internal sealed class CoreProcessService(PortablePaths paths) : IAsyncDisposable
             {
                 await process.StandardInput.WriteLineAsync("stop");
                 await process.StandardInput.FlushAsync();
-                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                // 全局模式退出时需要删除 IPv4/IPv6 路由，给 netsh 留出完整清理时间。
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
                 await process.WaitForExitAsync(timeout.Token);
             }
             catch (OperationCanceledException)
@@ -162,7 +171,8 @@ internal sealed class CoreProcessService(PortablePaths paths) : IAsyncDisposable
             return;
         }
         EmitLog(args.Data);
-        if (args.Data.Contains("SOCKS5 代理已开始监听", StringComparison.Ordinal))
+        var readyMessage = _globalMode ? "全局 TCP 代理已启用" : "SOCKS5 代理已开始监听";
+        if (args.Data.Contains(readyMessage, StringComparison.Ordinal))
         {
             SetState(CoreState.Connected);
         }

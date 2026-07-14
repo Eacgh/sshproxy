@@ -3,7 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="SSH VPN"
         Width="760"
-        Height="650"
+        Height="690"
         MinWidth="620"
         MinHeight="540"
         WindowStartupLocation="CenterScreen"
@@ -92,9 +92,37 @@
                             <TextBox x:Name="VisiblePasswordInput" AutomationProperties.AutomationId="VisiblePasswordInput" Visibility="Collapsed" TextChanged="VisiblePasswordInput_TextChanged" />
                         </Grid>
 
-                        <TextBlock x:Name="ValidationText" Grid.Row="7" Foreground="{StaticResource DangerBrush}" Visibility="Collapsed" Margin="0,0,0,14" />
+                        <Border Grid.Row="7" Background="#EEF7F4" BorderBrush="#B8DDD1" BorderThickness="1" CornerRadius="6" Padding="12,10" Margin="0,0,0,14">
+                            <StackPanel>
+                                <CheckBox x:Name="GlobalModeCheckBox"
+                                          AutomationProperties.AutomationId="GlobalModeCheckBox"
+                                          Content="启用全局模式（TCP）"
+                                          IsChecked="True"
+                                          FontWeight="SemiBold" />
+                                <TextBlock Text="自动接管 IPv4/IPv6、通过 SSH 解析 DNS；普通 UDP 暂不支持。"
+                                           Margin="24,5,0,0"
+                                           FontSize="12"
+                                           Foreground="{StaticResource MutedBrush}"
+                                           TextWrapping="Wrap" />
+                                <TextBlock Text="自定义上游 DNS（可选）"
+                                           Margin="24,12,0,6"
+                                           FontSize="12"
+                                           FontWeight="SemiBold" />
+                                <TextBox x:Name="DnsServerBox"
+                                         AutomationProperties.AutomationId="DnsServerBox"
+                                         Margin="24,0,0,0"
+                                         ToolTip="留空使用 Fake-IP；也可填写 DNS IP 或 IP:端口" />
+                                <TextBlock Text="留空时由 SSH 服务器解析；填写后通过 SSH 查询该 DNS，并以 Fake-IP 使用其 IPv4 结果。"
+                                           Margin="24,5,0,0"
+                                           FontSize="11"
+                                           Foreground="{StaticResource MutedBrush}"
+                                           TextWrapping="Wrap" />
+                            </StackPanel>
+                        </Border>
 
-                        <Grid Grid.Row="8">
+                        <TextBlock x:Name="ValidationText" Grid.Row="8" Foreground="{StaticResource DangerBrush}" Visibility="Collapsed" Margin="0,0,0,14" />
+
+                        <Grid Grid.Row="9">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="Auto" />
                                 <ColumnDefinition Width="*" />

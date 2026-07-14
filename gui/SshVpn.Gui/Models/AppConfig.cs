@@ -15,4 +15,8 @@ internal sealed class AppConfig
 
     [JsonPropertyName("proxy_port")]
     public int ProxyPort { get; set; } = 1080;
+
+    [JsonPropertyName("dns_server")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? DnsServer { get; set; }
 }
