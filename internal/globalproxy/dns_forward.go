@@ -9,23 +9,35 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
 )
 
+const (
+	dnsConnectionMaxIdle = 20 * time.Second
+	dnsReuseTimeout      = time.Second
+	customDNSConnections = 4
+)
+
 type customDNSResolver struct {
-	forward *forwardingDNSResolver
-	fake    *fakeDNSResolver
-	cache   *dnsNameCache
+	forwards []*forwardingDNSResolver
+	next     atomic.Uint32
+	fake     *fakeDNSResolver
+	cache    *dnsNameCache
 }
 
 func newCustomDNSResolver(dialer Dialer, address string, fake *fakeDNSResolver, cache *dnsNameCache) *customDNSResolver {
-	return &customDNSResolver{
-		forward: &forwardingDNSResolver{dialer: dialer, address: address},
-		fake:    fake,
-		cache:   cache,
+	resolver := &customDNSResolver{
+		forwards: make([]*forwardingDNSResolver, customDNSConnections),
+		fake:     fake,
+		cache:    cache,
 	}
+	for index := range resolver.forwards {
+		resolver.forwards[index] = &forwardingDNSResolver{dialer: dialer, address: address}
+	}
+	return resolver
 }
 
 // resolve 使用用户指定的 DNS 获得真实 IPv4，但只向 Windows 返回 Fake-IP。
@@ -43,7 +55,8 @@ func (r *customDNSResolver) resolve(ctx context.Context, payload []byte) ([]byte
 		return emptyDNSResponse(query)
 	}
 
-	upstreamPayload, err := r.forward.resolve(ctx, payload)
+	forward := r.forwards[(r.next.Add(1)-1)%uint32(len(r.forwards))]
+	upstreamPayload, err := forward.resolve(ctx, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +154,13 @@ func boundedCustomDNSTTL(ttl uint32) uint32 {
 }
 
 func (r *customDNSResolver) close() error {
-	return r.forward.close()
+	errs := make([]error, 0, len(r.forwards))
+	for _, forward := range r.forwards {
+		if err := forward.close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 type forwardingDNSResolver struct {
@@ -150,6 +169,7 @@ type forwardingDNSResolver struct {
 
 	mu         sync.Mutex
 	connection net.Conn
+	lastUsed   time.Time
 }
 
 // resolve 把 DNS 数据封装为 DNS-over-TCP，并通过 SSH 访问用户指定的服务器。
@@ -157,13 +177,21 @@ type forwardingDNSResolver struct {
 func (r *forwardingDNSResolver) resolve(ctx context.Context, payload []byte) ([]byte, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.connection != nil && time.Since(r.lastUsed) >= dnsConnectionMaxIdle {
+		r.connection.Close()
+		r.connection = nil
+	}
 	if r.connection != nil {
-		response, err := exchangeDNS(ctx, r.connection, payload)
+		response, err := exchangeReusedDNS(ctx, r.connection, payload)
 		if err == nil {
+			r.lastUsed = time.Now()
 			return response, nil
 		}
 		r.connection.Close()
 		r.connection = nil
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 	}
 
 	connection, err := r.dialer.DialContext(ctx, "tcp", r.address)
@@ -176,7 +204,17 @@ func (r *forwardingDNSResolver) resolve(ctx context.Context, payload []byte) ([]
 		return nil, fmt.Errorf("查询自定义 DNS %s 失败：%w", r.address, err)
 	}
 	r.connection = connection
+	r.lastUsed = time.Now()
 	return response, nil
+}
+
+func exchangeReusedDNS(ctx context.Context, connection net.Conn, payload []byte) ([]byte, error) {
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= dnsReuseTimeout {
+		return exchangeDNS(ctx, connection, payload)
+	}
+	reuseCtx, cancel := context.WithTimeout(ctx, dnsReuseTimeout)
+	defer cancel()
+	return exchangeDNS(reuseCtx, connection, payload)
 }
 
 func (r *forwardingDNSResolver) close() error {
@@ -187,6 +225,7 @@ func (r *forwardingDNSResolver) close() error {
 	}
 	err := r.connection.Close()
 	r.connection = nil
+	r.lastUsed = time.Time{}
 	return err
 }
 

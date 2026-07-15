@@ -95,6 +95,14 @@ func (t *sshTransport) targetAddress(metadata *M.Metadata, serverName string) st
 	return target
 }
 
+func (t *sshTransport) mappedServerName(metadata *M.Metadata) (string, bool) {
+	if metadata == nil || !metadata.DstIP.IsValid() {
+		return "", false
+	}
+	name, _, ok := t.dnsNames.lookupTarget(metadata.DstIP)
+	return name, ok
+}
+
 func (t *sshTransport) DialUDP(metadata *M.Metadata) (net.PacketConn, error) {
 	if metadata == nil || metadata.DstPort != 53 {
 		t.udpWarnOnce.Do(func() {

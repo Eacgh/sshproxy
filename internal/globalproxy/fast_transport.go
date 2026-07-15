@@ -80,9 +80,13 @@ func (h *fastTransportHandler) handleTCP(origin adapter.TCPConn) {
 	var initial []byte
 	var serverName string
 	if metadata.DstPort == 443 {
-		initial, serverName, err = sniffTLSServerName(origin)
-		if err != nil && len(initial) == 0 && !isTimeoutFailure(err) {
-			return
+		if mappedName, ok := h.transport.mappedServerName(metadata); ok {
+			serverName = mappedName
+		} else {
+			initial, serverName, err = sniffTLSServerName(origin)
+			if err != nil && len(initial) == 0 && !isTimeoutFailure(err) {
+				return
+			}
 		}
 	}
 	forwardTarget := h.transport.targetAddress(metadata, serverName)

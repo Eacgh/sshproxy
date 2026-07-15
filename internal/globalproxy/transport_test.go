@@ -44,6 +44,33 @@ func TestSSHTransportUsesDomainRestoredFromFakeIP(t *testing.T) {
 	}
 }
 
+func TestSSHTransportRecognizesMappedFakeIP(t *testing.T) {
+	transport := newSSHTransport(dialerFunc(func(context.Context, string, string) (net.Conn, error) {
+		t.Fatal("检查 Fake-IP 映射不应建立连接")
+		return nil, nil
+	}), "", slog.Default())
+	transport.dnsNames.store("example.com", netip.MustParseAddr("198.19.0.1"), time.Minute)
+
+	name, ok := transport.mappedServerName(&M.Metadata{DstIP: netip.MustParseAddr("198.19.0.1"), DstPort: 443})
+	if !ok || name != "example.com" {
+		t.Fatal("已有 Fake-IP 映射没有被识别")
+	}
+	transport.dnsNames.mu.Lock()
+	entry := transport.dnsNames.entries[netip.MustParseAddr("198.19.0.1")]
+	entry.expiresAt = time.Now().Add(-time.Second)
+	transport.dnsNames.entries[netip.MustParseAddr("198.19.0.1")] = entry
+	transport.dnsNames.mu.Unlock()
+	if target := transport.targetAddress(&M.Metadata{
+		DstIP:   netip.MustParseAddr("198.19.0.1"),
+		DstPort: 443,
+	}, name); target != "example.com:443" {
+		t.Fatalf("映射过期后的 SNI 后备目标为 %q", target)
+	}
+	if _, ok := transport.mappedServerName(&M.Metadata{DstIP: netip.MustParseAddr("203.0.113.8"), DstPort: 443}); ok {
+		t.Fatal("普通目标被错误识别为 Fake-IP")
+	}
+}
+
 func TestSSHTransportDialsTCPThroughManager(t *testing.T) {
 	var receivedAddress string
 	transport := newSSHTransport(dialerFunc(func(_ context.Context, network, address string) (net.Conn, error) {

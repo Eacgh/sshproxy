@@ -29,7 +29,8 @@ var (
 // 服务端响应的请求数量，避免大量不可达目标耗尽协程和 SSH 多路复用资源。
 const (
 	maxPendingSSHDials       = 24
-	maxPendingSSHToOneTarget = 1
+	maxPendingSSHToOneTarget = 4
+	sshKeepaliveTimeout      = 5 * time.Second
 )
 
 type targetDialState struct {
@@ -240,10 +241,28 @@ func (m *Manager) currentClient() *ssh.Client {
 
 // DialContext 通过 SSH direct-tcpip 通道连接目标地址。
 func (m *Manager) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	client, err := m.ensureConnected(ctx)
-	if err != nil {
-		return nil, err
+	for attempt := 0; attempt < 2; attempt++ {
+		client, err := m.ensureConnected(ctx)
+		if err != nil {
+			return nil, err
+		}
+		connection, err := m.dialWithClient(ctx, client, network, address)
+		if err == nil {
+			return connection, nil
+		}
+		if !isTransportClosed(err) || ctx.Err() != nil {
+			return nil, err
+		}
+		m.invalidate(client, err)
+		if attempt == 1 {
+			return nil, fmt.Errorf("SSH 自动重连后仍无法建立目标连接：%w", err)
+		}
+		m.logger.Info("正在自动重连 SSH 并重试目标连接", "目标", address)
 	}
+	return nil, errors.New("SSH 自动重连流程意外结束")
+}
+
+func (m *Manager) dialWithClient(ctx context.Context, client *ssh.Client, network, address string) (net.Conn, error) {
 	releaseTarget, err := m.acquireTargetDial(ctx, address)
 	if err != nil {
 		return nil, err
@@ -290,9 +309,6 @@ func (m *Manager) DialContext(ctx context.Context, network, address string) (net
 	case <-m.done:
 		return nil, net.ErrClosed
 	case result := <-resultCh:
-		if result.err != nil && isTransportClosed(result.err) {
-			m.invalidate(client, result.err)
-		}
 		return result.conn, result.err
 	}
 }
@@ -332,7 +348,12 @@ func (m *Manager) releaseTargetDial(address string, state *targetDialState) {
 }
 
 func isTransportClosed(err error) bool {
-	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "connection lost")
+	message := strings.ToLower(err.Error())
+	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) ||
+		strings.Contains(message, "connection lost") ||
+		strings.Contains(message, "client is closed") ||
+		strings.Contains(message, "use of closed network connection") ||
+		strings.Contains(message, "unexpected packet in response to channel open")
 }
 
 func (m *Manager) keepalive(client *ssh.Client) {
@@ -357,7 +378,7 @@ func (m *Manager) keepalive(client *ssh.Client) {
 				m.invalidate(client, err)
 				return
 			}
-		case <-time.After(m.cfg.ConnectTimeout()):
+		case <-time.After(sshKeepaliveTimeout):
 			m.invalidate(client, errors.New("SSH 保活请求超时"))
 			return
 		case <-m.done:

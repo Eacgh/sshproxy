@@ -67,6 +67,57 @@ func TestManagerDialsThroughSSHDirectTCPIP(t *testing.T) {
 	}
 }
 
+func TestManagerReconnectsAfterSSHTransportCloses(t *testing.T) {
+	useTemporaryDataDirectory(t)
+	target := startEchoServer(t)
+	sshAddress, serverConnections := startObservedSSHServer(t, "test-password")
+	cfg := config.Config{
+		ServerAddress: sshAddress,
+		Username:      "test-user",
+		Password:      "test-password",
+		ProxyPort:     1080,
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	manager, err := NewManager(cfg, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := manager.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	firstServerConnection := <-serverConnections
+	if err := firstServerConnection.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	connection, err := manager.DialContext(ctx, "tcp", target)
+	if err != nil {
+		t.Fatalf("SSH 旧连接关闭后没有自动重连：%v", err)
+	}
+	defer connection.Close()
+	select {
+	case <-serverConnections:
+	case <-ctx.Done():
+		t.Fatal("SSH 客户端没有建立第二条连接")
+	}
+
+	payload := []byte("reconnected")
+	if _, err := connection.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(connection, got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("自动重连后收到 %q，期望 %q", got, payload)
+	}
+}
+
 func TestTargetDialStateIsRemovedAfterUse(t *testing.T) {
 	manager := &Manager{
 		done:    make(chan struct{}),
@@ -152,6 +203,15 @@ func startEchoServer(t *testing.T) string {
 }
 
 func startSSHServer(t *testing.T, password string) string {
+	return startSSHServerWithObserver(t, password, nil)
+}
+
+func startObservedSSHServer(t *testing.T, password string) (string, <-chan *ssh.ServerConn) {
+	connections := make(chan *ssh.ServerConn, 4)
+	return startSSHServerWithObserver(t, password, connections), connections
+}
+
+func startSSHServerWithObserver(t *testing.T, password string, observer chan<- *ssh.ServerConn) string {
 	t.Helper()
 	signer := generateSigner(t)
 	serverConfig := &ssh.ServerConfig{
@@ -175,19 +235,22 @@ func startSSHServer(t *testing.T, password string) string {
 			if err != nil {
 				return
 			}
-			go serveSSHConnection(conn, serverConfig)
+			go serveSSHConnectionObserved(conn, serverConfig, observer)
 		}
 	}()
 	return listener.Addr().String()
 }
 
-func serveSSHConnection(conn net.Conn, serverConfig *ssh.ServerConfig) {
+func serveSSHConnectionObserved(conn net.Conn, serverConfig *ssh.ServerConfig, observer chan<- *ssh.ServerConn) {
 	serverConn, channels, requests, err := ssh.NewServerConn(conn, serverConfig)
 	if err != nil {
 		conn.Close()
 		return
 	}
 	defer serverConn.Close()
+	if observer != nil {
+		observer <- serverConn
+	}
 	go ssh.DiscardRequests(requests)
 	for newChannel := range channels {
 		go handleDirectTCPIP(newChannel)

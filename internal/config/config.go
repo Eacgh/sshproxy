@@ -16,7 +16,7 @@ const (
 	defaultSSHPort     = 22
 	defaultProxyPort   = 1080
 	connectTimeout     = 15 * time.Second
-	keepaliveInterval  = 30 * time.Second
+	keepaliveInterval  = 10 * time.Second
 	loopbackListenHost = "127.0.0.1"
 )
 

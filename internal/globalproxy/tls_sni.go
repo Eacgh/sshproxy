@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	tlsClientHelloTimeout = time.Second
+	tlsClientHelloTimeout = 300 * time.Millisecond
 	maxTLSRecordPayload   = (16 << 10) + 2048
 )
 
