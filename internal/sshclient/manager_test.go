@@ -123,16 +123,24 @@ func TestTargetDialStateIsRemovedAfterUse(t *testing.T) {
 		done:    make(chan struct{}),
 		targets: make(map[string]*targetDialState),
 	}
-	release, err := manager.acquireTargetDial(context.Background(), "example.com:443")
-	if err != nil {
-		t.Fatal(err)
+	// 先占满同目标的所有槽位，使 send 分支不可就绪，确保取消的
+	// 上下文必然被 select 选中，而不是与可用的槽位分支竞争。
+	releases := make([]func(), 0, maxPendingSSHToOneTarget)
+	for range maxPendingSSHToOneTarget {
+		release, err := manager.acquireTargetDial(context.Background(), "example.com:443")
+		if err != nil {
+			t.Fatal(err)
+		}
+		releases = append(releases, release)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := manager.acquireTargetDial(ctx, "example.com:443"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("等待同目标名额返回 %v", err)
 	}
-	release()
+	for _, release := range releases {
+		release()
+	}
 	manager.dialMu.Lock()
 	defer manager.dialMu.Unlock()
 	if len(manager.targets) != 0 {
