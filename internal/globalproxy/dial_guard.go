@@ -11,9 +11,12 @@ import (
 
 const (
 	maxConcurrentGlobalDials     = 12
-	maxConcurrentTargetDials     = 1
-	targetTimeoutInitialCooldown = time.Minute
-	targetTimeoutMaximumCooldown = 8 * time.Minute
+	// 同一目标允许少量并发，对齐 SOCKS5 的多连接行为，避免页面多个资源排队。
+	maxConcurrentTargetDials     = 4
+	// 冷却只用于避免同一目标短时间内重复堆积建连，不应把慢链路长期拒之门外；
+	// 所以从短冷却开始，最多暂停 1 分钟。
+	targetTimeoutInitialCooldown = 5 * time.Second
+	targetTimeoutMaximumCooldown = time.Minute
 )
 
 type targetDialState struct {

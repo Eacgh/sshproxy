@@ -17,7 +17,9 @@ import (
 )
 
 const (
-	tcpDialTimeout   = 6 * time.Second
+	// 建连超时要覆盖 SSH 通道建立、服务器端解析域名和连接目标的完整过程；
+	// 太短会把慢链路误判为不可达并触发熔断，导致页面整体不可用。
+	tcpDialTimeout   = 15 * time.Second
 	tcpHalfCloseTime = 60 * time.Second
 	tcpRelayBuffer   = 128 << 10
 	udpRelayBuffer   = (1 << 16) - 1
@@ -87,6 +89,12 @@ func (h *fastTransportHandler) handleTCP(origin adapter.TCPConn) {
 			if err != nil && len(initial) == 0 && !isTimeoutFailure(err) {
 				return
 			}
+			// 嗅探彻底失败且没有拿到域名时，目标 DstIP 是浏览器缓存的过期
+			// Fake-IP，不能把它当真实地址去连（必失败并触发熔断）；直接关闭
+			// 让浏览器重新解析 DNS 拿到新的映射。
+			if len(initial) == 0 && serverName == "" {
+				return
+			}
 		}
 	}
 	forwardTarget := h.transport.targetAddress(metadata, serverName)
@@ -114,6 +122,7 @@ func (h *fastTransportHandler) handleTCP(origin adapter.TCPConn) {
 		h.logDialFailure(forwardTarget, err)
 		return
 	}
+	h.logger.Debug("全局 TCP 通道已建立", "目标", forwardTarget)
 
 	relayTCP(origin, remote)
 }
