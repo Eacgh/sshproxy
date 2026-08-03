@@ -17,6 +17,14 @@ const (
 	fakeIPv4AddressMax = (1 << 16) - 2
 )
 
+// fakeIPv4Prefix 是 Fake-IP 使用的保留段，与正常公网地址互不重叠。
+var fakeIPv4Prefix = netip.MustParsePrefix("198.19.0.0/16")
+
+// isFakeAddress 判断地址是否属于本程序分配的 Fake-IP 保留段。
+func isFakeAddress(address netip.Addr) bool {
+	return fakeIPv4Prefix.Contains(address.Unmap())
+}
+
 type fakeDNSAddresses struct {
 	ipv4 netip.Addr
 	ipv6 netip.Addr
@@ -51,8 +59,10 @@ func (r *fakeDNSResolver) resolve(payload []byte) ([]byte, error) {
 
 	response := newDNSResponse(query)
 	for _, question := range query.Questions {
-		if question.Class != dnsmessage.ClassINET ||
-			(question.Type != dnsmessage.TypeA && question.Type != dnsmessage.TypeAAAA) {
+		// 只对 A 返回 Fake-IP；AAAA 返回空回答，让浏览器直接走 IPv4，
+		// 避免先尝试 IPv6 通道（SSH 服务器通常没有 IPv6 出口）再失败回退，
+		// 每个域名白等一次失败的往返。与自定义 DNS 模式的 IPv4 优先一致。
+		if question.Class != dnsmessage.ClassINET || question.Type != dnsmessage.TypeA {
 			continue
 		}
 		name := normalizedDNSName(question.Name)
@@ -69,17 +79,10 @@ func (r *fakeDNSResolver) resolve(payload []byte) ([]byte, error) {
 			Class: dnsmessage.ClassINET,
 			TTL:   fakeDNSAnswerTTL,
 		}
-		if question.Type == dnsmessage.TypeA {
-			response.Answers = append(response.Answers, dnsmessage.Resource{
-				Header: header,
-				Body:   &dnsmessage.AResource{A: addresses.ipv4.As4()},
-			})
-		} else {
-			response.Answers = append(response.Answers, dnsmessage.Resource{
-				Header: header,
-				Body:   &dnsmessage.AAAAResource{AAAA: addresses.ipv6.As16()},
-			})
-		}
+		response.Answers = append(response.Answers, dnsmessage.Resource{
+			Header: header,
+			Body:   &dnsmessage.AResource{A: addresses.ipv4.As4()},
+		})
 	}
 	packed, err := response.Pack()
 	if err != nil {
