@@ -42,107 +42,147 @@
 
         <TabControl x:Name="MainTabs" Grid.Row="1" Margin="24,18,24,14" Background="Transparent" BorderBrush="{StaticResource BorderBrush}">
             <TabItem Header="连接">
-                <ScrollViewer VerticalScrollBarVisibility="Auto">
-                    <Grid Margin="26,24,26,28" MaxWidth="620" HorizontalAlignment="Stretch">
-                        <Grid.RowDefinitions>
-                            <RowDefinition Height="Auto" />
-                            <RowDefinition Height="Auto" />
-                            <RowDefinition Height="Auto" />
-                            <RowDefinition Height="Auto" />
-                            <RowDefinition Height="Auto" />
-                            <RowDefinition Height="Auto" />
-                            <RowDefinition Height="Auto" />
-                            <RowDefinition Height="Auto" />
-                            <RowDefinition Height="Auto" />
-                            <RowDefinition Height="Auto" />
-                        </Grid.RowDefinitions>
+                <Grid Margin="24,24,24,28">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="240" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
 
-                        <TextBlock Grid.Row="0" Text="连接设置" FontSize="20" FontWeight="SemiBold" Margin="0,0,0,20" />
-
-                        <TextBlock Grid.Row="1" Text="服务器地址" FontSize="13" FontWeight="SemiBold" Margin="0,0,0,7" />
-                        <TextBox x:Name="ServerAddressBox" AutomationProperties.AutomationId="ServerAddressBox" Grid.Row="2" Margin="0,0,0,16" ToolTip="域名、IP 或 主机:端口" />
-
-                        <Grid Grid.Row="3" Margin="0,0,0,7">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="150" />
-                            </Grid.ColumnDefinitions>
-                            <TextBlock Text="用户名" FontSize="13" FontWeight="SemiBold" />
-                            <TextBlock Grid.Column="1" Text="代理端口" FontSize="13" FontWeight="SemiBold" Margin="14,0,0,0" />
+                    <!-- 左栏：服务器列表 -->
+                    <Border Grid.Column="0" Background="{StaticResource SurfaceBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="6" Padding="14">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="*" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
+                            <Grid Margin="0,0,0,10">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Text="服务器列表" FontSize="15" FontWeight="SemiBold" VerticalAlignment="Center" />
+                                <Button Grid.Column="1" x:Name="ManageServersButton" AutomationProperties.AutomationId="ManageServersButton" AutomationProperties.Name="管理服务器" Style="{StaticResource SecondaryButton}" Height="26" Padding="10,0" FontSize="12" Click="ManageServersButton_Click">
+                                    <TextBlock Text="管理" />
+                                </Button>
+                            </Grid>
+                            <ListBox x:Name="ServerListBox" AutomationProperties.AutomationId="ServerListBox" Grid.Row="1" SelectionChanged="ServerListBox_SelectionChanged" BorderThickness="0" Background="Transparent">
+                                <ListBox.ItemTemplate>
+                                    <DataTemplate>
+                                        <StackPanel>
+                                            <TextBlock Text="{Binding Name}" FontWeight="SemiBold" />
+                                            <TextBlock Text="{Binding ServerAddress}" FontSize="11" Foreground="{StaticResource MutedBrush}" TextTrimming="CharacterEllipsis" />
+                                        </StackPanel>
+                                    </DataTemplate>
+                                </ListBox.ItemTemplate>
+                            </ListBox>
+                            <TextBlock Grid.Row="2" Text="点击服务器查看或修改配置" FontSize="11" Foreground="{StaticResource MutedBrush}" Margin="0,10,0,0" TextWrapping="Wrap" />
                         </Grid>
-                        <Grid Grid.Row="4" Margin="0,0,0,16">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="150" />
-                            </Grid.ColumnDefinitions>
-                            <TextBox x:Name="UsernameBox" AutomationProperties.AutomationId="UsernameBox" />
-                            <TextBox x:Name="ProxyPortBox" AutomationProperties.AutomationId="ProxyPortBox" Grid.Column="1" Margin="14,0,0,0" Text="1080" MaxLength="5" />
-                        </Grid>
+                    </Border>
 
-                        <Grid Grid.Row="5" Margin="0,0,0,7">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="Auto" />
-                            </Grid.ColumnDefinitions>
-                            <TextBlock Text="密码" FontSize="13" FontWeight="SemiBold" />
-                            <CheckBox x:Name="ShowPasswordCheckBox" Grid.Column="1" Content="显示密码" Checked="ShowPassword_Checked" Unchecked="ShowPassword_Unchecked" />
-                        </Grid>
-                        <Grid Grid.Row="6" Margin="0,0,0,18">
-                            <PasswordBox x:Name="PasswordInput" AutomationProperties.AutomationId="PasswordInput" PasswordChanged="PasswordInput_PasswordChanged" />
-                            <TextBox x:Name="VisiblePasswordInput" AutomationProperties.AutomationId="VisiblePasswordInput" Visibility="Collapsed" TextChanged="VisiblePasswordInput_TextChanged" />
-                        </Grid>
+                    <!-- 右栏：当前服务器的连接表单 -->
+                    <ScrollViewer Grid.Column="1" VerticalScrollBarVisibility="Auto" Margin="28,0,0,0">
+                        <Grid MaxWidth="560" HorizontalAlignment="Stretch">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
 
-                        <Border Grid.Row="7" Background="#EEF7F4" BorderBrush="#B8DDD1" BorderThickness="1" CornerRadius="6" Padding="12,10" Margin="0,0,0,14">
-                            <StackPanel>
-                                <CheckBox x:Name="GlobalModeCheckBox"
-                                          AutomationProperties.AutomationId="GlobalModeCheckBox"
-                                          Content="启用全局模式（TCP）"
-                                          IsChecked="True"
-                                          FontWeight="SemiBold" />
-                                <TextBlock Text="自动接管 IPv4/IPv6、通过 SSH 解析 DNS；普通 UDP 暂不支持。"
-                                           Margin="24,5,0,0"
-                                           FontSize="12"
-                                           Foreground="{StaticResource MutedBrush}"
-                                           TextWrapping="Wrap" />
-                                <TextBlock Text="自定义上游 DNS（可选）"
-                                           Margin="24,12,0,6"
-                                           FontSize="12"
-                                           FontWeight="SemiBold" />
-                                <TextBox x:Name="DnsServerBox"
-                                         AutomationProperties.AutomationId="DnsServerBox"
-                                         Margin="24,0,0,0"
-                                         ToolTip="留空使用 Fake-IP；也可填写 DNS IP 或 IP:端口" />
-                                <TextBlock Text="留空时由 SSH 服务器解析；填写后通过 SSH 查询该 DNS，并以 Fake-IP 使用其 IPv4 结果。"
-                                           Margin="24,5,0,0"
-                                           FontSize="11"
-                                           Foreground="{StaticResource MutedBrush}"
-                                           TextWrapping="Wrap" />
-                            </StackPanel>
-                        </Border>
+                            <TextBlock Grid.Row="0" Text="连接设置" FontSize="20" FontWeight="SemiBold" Margin="0,0,0,16" />
 
-                        <TextBlock x:Name="ValidationText" Grid.Row="8" Foreground="{StaticResource DangerBrush}" Visibility="Collapsed" Margin="0,0,0,14" />
+                            <TextBlock Grid.Row="1" Text="服务器地址" FontSize="13" FontWeight="SemiBold" Margin="0,0,0,7" />
+                            <TextBox x:Name="ServerAddressBox" AutomationProperties.AutomationId="ServerAddressBox" Grid.Row="2" Margin="0,0,0,16" ToolTip="域名、IP 或 主机:端口" />
 
-                        <Grid Grid.Row="9">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="Auto" />
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="Auto" />
-                            </Grid.ColumnDefinitions>
-                            <Button x:Name="SaveButton" AutomationProperties.AutomationId="SaveButton" AutomationProperties.Name="保存配置" Style="{StaticResource SecondaryButton}" Click="SaveButton_Click">
-                                <StackPanel Orientation="Horizontal">
-                                    <TextBlock Text="&#xE74E;" FontFamily="Segoe Fluent Icons" Margin="0,0,8,0" />
-                                    <TextBlock Text="保存配置" />
+                            <Grid Grid.Row="3" Margin="0,0,0,7">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="150" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Text="用户名" FontSize="13" FontWeight="SemiBold" />
+                                <TextBlock Grid.Column="1" Text="代理端口" FontSize="13" FontWeight="SemiBold" Margin="14,0,0,0" />
+                            </Grid>
+                            <Grid Grid.Row="4" Margin="0,0,0,16">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="150" />
+                                </Grid.ColumnDefinitions>
+                                <TextBox x:Name="UsernameBox" AutomationProperties.AutomationId="UsernameBox" />
+                                <TextBox x:Name="ProxyPortBox" AutomationProperties.AutomationId="ProxyPortBox" Grid.Column="1" Margin="14,0,0,0" Text="1080" MaxLength="5" />
+                            </Grid>
+
+                            <Grid Grid.Row="5" Margin="0,0,0,7">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Text="密码" FontSize="13" FontWeight="SemiBold" />
+                                <CheckBox x:Name="ShowPasswordCheckBox" Grid.Column="1" Content="显示密码" Checked="ShowPassword_Checked" Unchecked="ShowPassword_Unchecked" />
+                            </Grid>
+                            <Grid Grid.Row="6" Margin="0,0,0,18">
+                                <PasswordBox x:Name="PasswordInput" AutomationProperties.AutomationId="PasswordInput" PasswordChanged="PasswordInput_PasswordChanged" />
+                                <TextBox x:Name="VisiblePasswordInput" AutomationProperties.AutomationId="VisiblePasswordInput" Visibility="Collapsed" TextChanged="VisiblePasswordInput_TextChanged" />
+                            </Grid>
+
+                            <Border Grid.Row="7" Background="#EEF7F4" BorderBrush="#B8DDD1" BorderThickness="1" CornerRadius="6" Padding="12,10" Margin="0,0,0,14">
+                                <StackPanel>
+                                    <CheckBox x:Name="GlobalModeCheckBox"
+                                              AutomationProperties.AutomationId="GlobalModeCheckBox"
+                                              Content="启用全局模式（TCP）"
+                                              IsChecked="True"
+                                              FontWeight="SemiBold" />
+                                    <TextBlock Text="自动接管 IPv4/IPv6、通过 SSH 解析 DNS；普通 UDP 暂不支持。"
+                                               Margin="24,5,0,0"
+                                               FontSize="12"
+                                               Foreground="{StaticResource MutedBrush}"
+                                               TextWrapping="Wrap" />
+                                    <TextBlock Text="自定义上游 DNS（可选）"
+                                               Margin="24,12,0,6"
+                                               FontSize="12"
+                                               FontWeight="SemiBold" />
+                                    <TextBox x:Name="DnsServerBox"
+                                             AutomationProperties.AutomationId="DnsServerBox"
+                                             Margin="24,0,0,0"
+                                             ToolTip="留空使用 Fake-IP；也可填写 DNS IP 或 IP:端口" />
+                                    <TextBlock Text="留空时由 SSH 服务器解析；填写后通过 SSH 查询该 DNS，并以 Fake-IP 使用其 IPv4 结果。"
+                                               Margin="24,5,0,0"
+                                               FontSize="11"
+                                               Foreground="{StaticResource MutedBrush}"
+                                               TextWrapping="Wrap" />
                                 </StackPanel>
-                            </Button>
-                            <Button x:Name="ConnectButton" AutomationProperties.AutomationId="ConnectButton" AutomationProperties.Name="连接或断开" Grid.Column="2" Style="{StaticResource PrimaryButton}" Click="ConnectButton_Click" MinWidth="112">
-                                <StackPanel Orientation="Horizontal">
-                                    <TextBlock x:Name="ConnectButtonIcon" Text="&#xE768;" FontFamily="Segoe Fluent Icons" Margin="0,0,8,0" />
-                                    <TextBlock x:Name="ConnectButtonText" Text="连接" Foreground="White" />
-                                </StackPanel>
-                            </Button>
+                            </Border>
+
+                            <TextBlock x:Name="ValidationText" Grid.Row="8" Foreground="{StaticResource DangerBrush}" Visibility="Collapsed" Margin="0,0,0,14" />
+
+                            <Grid Grid.Row="9">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <Button x:Name="SaveButton" AutomationProperties.AutomationId="SaveButton" AutomationProperties.Name="保存配置" Style="{StaticResource SecondaryButton}" Click="SaveButton_Click">
+                                    <StackPanel Orientation="Horizontal">
+                                        <TextBlock Text="&#xE74E;" FontFamily="Segoe Fluent Icons" Margin="0,0,8,0" />
+                                        <TextBlock Text="保存配置" />
+                                    </StackPanel>
+                                </Button>
+                                <Button x:Name="ConnectButton" AutomationProperties.AutomationId="ConnectButton" AutomationProperties.Name="连接或断开" Grid.Column="2" Style="{StaticResource PrimaryButton}" Click="ConnectButton_Click" MinWidth="112">
+                                    <StackPanel Orientation="Horizontal">
+                                        <TextBlock x:Name="ConnectButtonIcon" Text="&#xE768;" FontFamily="Segoe Fluent Icons" Margin="0,0,8,0" />
+                                        <TextBlock x:Name="ConnectButtonText" Text="连接" Foreground="White" />
+                                    </StackPanel>
+                                </Button>
+                            </Grid>
                         </Grid>
-                    </Grid>
-                </ScrollViewer>
+                    </ScrollViewer>
+                </Grid>
             </TabItem>
 
             <TabItem x:Name="LogTab" Header="日志">
@@ -206,8 +246,12 @@
             </TabItem>
         </TabControl>
 
-        <Border Grid.Row="2" Background="{StaticResource SurfaceBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,1,0,0" Padding="24,12">
+        <Border Grid.Row="2" Background="{StaticResource SurfaceBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,1,0,0" Padding="24,10">
             <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto" />
                     <ColumnDefinition Width="*" />
@@ -221,6 +265,13 @@
                         <TextBlock Text="打开目录" />
                     </StackPanel>
                 </Button>
+                <StackPanel Grid.Row="1" Grid.ColumnSpan="3" Orientation="Horizontal" Margin="0,6,0,0">
+                    <TextBlock Text="流量" Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center" Margin="0,0,8,0" />
+                    <TextBlock x:Name="TrafficText" Text="上行 0 B · 下行 0 B" FontSize="12" VerticalAlignment="Center" />
+                    <Button x:Name="ResetTrafficButton" AutomationProperties.AutomationId="ResetTrafficButton" AutomationProperties.Name="重置流量" Style="{StaticResource SecondaryButton}" Height="24" Padding="8,0" Margin="12,0,0,0" FontSize="11" Click="ResetTrafficButton_Click" ToolTip="清零累计流量统计">
+                        <TextBlock Text="重置" />
+                    </Button>
+                </StackPanel>
             </Grid>
         </Border>
     </Grid>

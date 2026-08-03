@@ -2,10 +2,12 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Net;
+using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Media;
 using SshVpn.Gui.Models;
 using SshVpn.Gui.Services;
+using SshVpn.Gui.Windows;
 using DrawingSystemIcons = System.Drawing.SystemIcons;
 using Forms = System.Windows.Forms;
 
@@ -17,9 +19,12 @@ public partial class MainWindow : Window
     private readonly ConfigService _configService;
     private readonly CorePayloadService _corePayloadService;
     private readonly CoreProcessService _coreService;
+    private readonly ServerProfileService _serverService;
     private readonly Forms.NotifyIcon _trayIcon;
     private readonly Forms.ToolStripMenuItem _trayToggleItem;
+    private List<ServerProfile> _profiles = new();
     private bool _syncingPassword;
+    private bool _syncingServerSelection;
     private bool _exitRequested;
     private bool _allowClose;
     private bool _closing;
@@ -31,6 +36,7 @@ public partial class MainWindow : Window
         _configService = new ConfigService(_paths);
         _corePayloadService = new CorePayloadService(_paths);
         _coreService = new CoreProcessService(_paths);
+        _serverService = new ServerProfileService(_paths);
         _coreService.LogReceived += CoreService_LogReceived;
         _coreService.StateChanged += CoreService_StateChanged;
 
@@ -62,6 +68,39 @@ public partial class MainWindow : Window
             var coreUpdated = await _corePayloadService.EnsureCoreAsync();
             AddLog(coreUpdated ? "Go 核心已从 GUI 自动释放或更新" : "Go 核心已就绪");
 
+            await LoadProfilesAsync();
+        }
+        catch (Exception ex)
+        {
+            ShowValidation(ex.Message);
+            AddLog(ex.Message);
+        }
+    }
+
+    // LoadProfilesAsync 读取服务器列表；没有列表时用现有 config.json 生成默认条目（旧版兼容）。
+    private async Task LoadProfilesAsync()
+    {
+        _profiles = await _serverService.LoadAsync();
+        if (_profiles.Count == 0)
+        {
+            var config = await _configService.LoadAsync();
+            if (!string.IsNullOrWhiteSpace(config.ServerAddress))
+            {
+                _profiles.Add(ServerProfileService.FromAppConfig(config));
+                await _serverService.SaveAsync(_profiles);
+                AddLog("已从现有配置生成默认服务器条目");
+            }
+        }
+
+        _syncingServerSelection = true;
+        ServerListBox.ItemsSource = null;
+        ServerListBox.ItemsSource = _profiles;
+        ServerListBox.SelectedIndex = _profiles.Count > 0 ? 0 : -1;
+        _syncingServerSelection = false;
+
+        if (_profiles.Count == 0)
+        {
+            // 没有任何服务器时，仍尝试读取 config.json 填充表单（保持旧行为）。
             var config = await _configService.LoadAsync();
             ServerAddressBox.Text = config.ServerAddress;
             UsernameBox.Text = config.Username;
@@ -71,12 +110,64 @@ public partial class MainWindow : Window
             UpdateEndpointText(config.ProxyPort);
             AddLog(File.Exists(_paths.ConfigPath) ? "已读取同目录配置" : "尚未创建配置文件");
         }
+    }
+
+    // ApplyProfileToForm 把选中服务器刷新到表单。
+    private void ApplyProfileToForm(ServerProfile? profile)
+    {
+        if (profile == null)
+        {
+            return;
+        }
+        ServerAddressBox.Text = profile.ServerAddress;
+        UsernameBox.Text = profile.Username;
+        PasswordInput.Password = profile.Password;
+        VisiblePasswordInput.Text = profile.Password;
+        ProxyPortBox.Text = profile.ProxyPort.ToString();
+        DnsServerBox.Text = profile.DnsServer ?? string.Empty;
+        UpdateEndpointText(profile.ProxyPort);
+    }
+
+    private async void ServerListBox_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        if (_syncingServerSelection || ServerListBox.SelectedItem is not ServerProfile profile)
+        {
+            return;
+        }
+        ApplyProfileToForm(profile);
+        try
+        {
+            await _configService.SaveAsync(ServerProfileService.ToAppConfig(profile));
+            AddLog($"已切换到服务器：{profile.Name}");
+        }
         catch (Exception ex)
         {
-            ShowValidation(ex.Message);
-            AddLog(ex.Message);
+            AddLog($"保存服务器配置失败：{ex.Message}");
         }
+    }
 
+    private void ManageServersButton_Click(object sender, RoutedEventArgs e)
+    {
+        var selectedName = (ServerListBox.SelectedItem as ServerProfile)?.Name;
+        var window = new ServerManagerWindow(_serverService, _profiles);
+        window.ProfilesChanged += () =>
+        {
+            var previousIndex = ServerListBox.SelectedIndex;
+            _syncingServerSelection = true;
+            ServerListBox.ItemsSource = null;
+            ServerListBox.ItemsSource = _profiles;
+            // 尽量保持原来的选中项。
+            ServerListBox.SelectedIndex = _profiles.Count > 0
+                ? Math.Max(0, Math.Min(previousIndex, _profiles.Count - 1))
+                : -1;
+            _syncingServerSelection = false;
+            if (ServerListBox.SelectedItem is ServerProfile current)
+            {
+                ApplyProfileToForm(current);
+            }
+        };
+        window.Owner = this;
+        window.ShowDialog();
     }
 
     private async void SaveButton_Click(object sender, RoutedEventArgs e)
@@ -157,6 +248,18 @@ public partial class MainWindow : Window
             DnsServer = string.IsNullOrEmpty(dnsServer) ? null : dnsServer
         };
         await _configService.SaveAsync(config);
+
+        // 同步更新当前选中的服务器条目，保证列表与表单一致。
+        if (ServerListBox.SelectedItem is ServerProfile current)
+        {
+            current.ServerAddress = config.ServerAddress;
+            current.Username = config.Username;
+            current.Password = config.Password;
+            current.ProxyPort = config.ProxyPort;
+            current.DnsServer = config.DnsServer;
+            await _serverService.SaveAsync(_profiles);
+        }
+
         UpdateEndpointText(proxyPort);
         AddLog("配置已保存到程序目录");
         return true;
@@ -228,6 +331,7 @@ public partial class MainWindow : Window
 
     private void AddLog(string message)
     {
+        TryUpdateTraffic(message);
         var line = $"{DateTime.Now:HH:mm:ss}  {FormatLogMessage(message)}";
         LogList.Items.Add(line);
         while (LogList.Items.Count > 1000)
@@ -235,6 +339,77 @@ public partial class MainWindow : Window
             LogList.Items.RemoveAt(0);
         }
         LogList.ScrollIntoView(LogList.Items[^1]);
+    }
+
+    // 解析核心每秒输出的“流量统计”日志，更新状态栏显示。
+    // 格式：... 消息="流量统计" 上行=xx 下行=xx
+    private static readonly Regex TrafficLogRegex = new(
+        @"流量统计.*?上行=([0-9]+)\s+下行=([0-9]+)",
+        RegexOptions.Compiled);
+
+    private void TryUpdateTraffic(string message)
+    {
+        if (!message.Contains("流量统计", StringComparison.Ordinal))
+        {
+            return;
+        }
+        var match = TrafficLogRegex.Match(message);
+        if (!match.Success)
+        {
+            return;
+        }
+        var upload = ulong.TryParse(match.Groups[1].Value, out var u) ? u : 0;
+        var download = ulong.TryParse(match.Groups[2].Value, out var d) ? d : 0;
+        TrafficText.Text = $"上行 {FormatBytes(upload)} · 下行 {FormatBytes(download)}";
+    }
+
+    private static string FormatBytes(ulong bytes)
+    {
+        const ulong kb = 1 << 10;
+        const ulong mb = 1 << 20;
+        const ulong gb = 1 << 30;
+        return bytes switch
+        {
+            >= gb => $"{bytes / (double)gb:0.00} GB",
+            >= mb => $"{bytes / (double)mb:0.00} MB",
+            >= kb => $"{bytes / (double)kb:0.00} KB",
+            _ => $"{bytes} B"
+        };
+    }
+
+    private async void ResetTrafficButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (System.Windows.MessageBox.Show(this, "确定清零累计流量统计吗？", "重置流量",
+                MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes)
+        {
+            return;
+        }
+        try
+        {
+            if (_coreService.State is CoreState.Starting or CoreState.Connected)
+            {
+                // 核心运行中：停止后用 -reset-traffic 重新启动，让核心清零并持久化。
+                AddLog("正在重启核心以重置流量统计");
+                await _coreService.StopAsync();
+                await _coreService.StartAsync(GlobalModeCheckBox.IsChecked == true, resetTraffic: true);
+                AddLog("已重置流量统计");
+            }
+            else
+            {
+                // 核心未运行：直接删除持久化文件。
+                var trafficPath = Path.Combine(_paths.BaseDirectory, "traffic.json");
+                if (File.Exists(trafficPath))
+                {
+                    File.Delete(trafficPath);
+                }
+                TrafficText.Text = "上行 0 B · 下行 0 B";
+                AddLog("已重置流量统计");
+            }
+        }
+        catch (Exception ex)
+        {
+            AddLog($"重置流量统计失败：{ex.Message}");
+        }
     }
 
     // Go slog 已经包含完整 ISO 时间；GUI 保留自己的短时间并压缩重复字段。
