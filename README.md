@@ -93,21 +93,17 @@ curl.exe --proxy socks5h://127.0.0.1:1080 https://ip.me/
 
 ## 构建单文件 GUI
 
-需要 Go 1.26 和 .NET 10 SDK。顺序固定为“先核心，后 GUI”，且必须在 `dotnet publish` 之前给核心签名——GUI 会把签名后的核心原样嵌入，运行时解压出的核心才会被系统应用控制放行。在仓库根目录依次执行：
+需要 Go 1.26 和 .NET 10 SDK。顺序固定为“先核心，后 GUI”。在仓库根目录依次执行：
 
 ```text
 go test -buildvcs=false ./...
 go build -buildvcs=false -trimpath -ldflags="-s -w" -o gui/SshVpn.Gui/Resources/sshvpn-core.exe ./cmd/sshvpn
-powershell -ExecutionPolicy Bypass -File scripts/sign-core.ps1
 dotnet publish gui/SshVpn.Gui/SshVpn.Gui.csproj -p:PublishProfile=Portable
-powershell -ExecutionPolicy Bypass -File scripts/sign-core.ps1 -GuiPath artifacts\sshvpn-portable\SshVpn.exe
 ```
 
 发布结果位于 `artifacts\sshvpn-portable\SshVpn.exe`。第一次发布可能从 NuGet 下载 .NET 单文件发布所需的运行包，仓库中的 `NuGet.Config` 会把缓存固定到 `.cache\nuget`，不会写入用户 NuGet 目录。
 
 如果 Go 核心没有先生成，`dotnet publish` 会用中文错误明确中止，不会产出缺少核心的 GUI。
-
-> **代码签名**：部分 Windows 会启用应用控制（Device Guard / Smart App Control）策略，要求可执行文件满足企业签名级别。核心必须在 `dotnet publish` **之前**签名，否则 GUI 内嵌的会是未签名核心，运行时解压出来直接被系统阻止（表现为 GUI 报“应用程序控制策略已阻止此文件”）。`scripts/sign-core.ps1` 用本机自签名证书给核心和发布后的 GUI 签名，并把证书根加入当前用户受信任根。证书首次生成后复用，之后每次编译重新运行签名脚本即可。自签名证书只解决本机应用控制放行，发给其他机器仍可能提示“未知发布者”。
 
 ## 单独构建 Go 核心
 
