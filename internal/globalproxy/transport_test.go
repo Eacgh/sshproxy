@@ -363,6 +363,35 @@ func TestDNSPacketConnAnswersWithStableFakeIP(t *testing.T) {
 	}
 }
 
+// TestFakeDNSFiltersAAAA 验证 Fake-IP 模式对 AAAA 查询返回空回答，
+// 让浏览器直接走 IPv4，避免先尝试没有 IPv6 出口的服务器再失败回退。
+func TestFakeDNSFiltersAAAA(t *testing.T) {
+	name, err := dnsmessage.NewName("example.org.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := dnsmessage.Message{
+		Header:    dnsmessage.Header{ID: 0x77},
+		Questions: []dnsmessage.Question{{Name: name, Type: dnsmessage.TypeAAAA, Class: dnsmessage.ClassINET}},
+	}
+	query, err := message.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver := newFakeDNSResolver(newDNSNameCache())
+	response, err := resolver.resolve(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var unpacked dnsmessage.Message
+	if err := unpacked.Unpack(response); err != nil {
+		t.Fatal(err)
+	}
+	if len(unpacked.Answers) != 0 {
+		t.Fatalf("AAAA 查询返回了 %d 条 Fake-IP 回答", len(unpacked.Answers))
+	}
+}
+
 func TestFakeDNSTCPConnAnswersLocally(t *testing.T) {
 	name, err := dnsmessage.NewName("example.net.")
 	if err != nil {
@@ -370,7 +399,7 @@ func TestFakeDNSTCPConnAnswersLocally(t *testing.T) {
 	}
 	message := dnsmessage.Message{
 		Header:    dnsmessage.Header{ID: 7},
-		Questions: []dnsmessage.Question{{Name: name, Type: dnsmessage.TypeAAAA, Class: dnsmessage.ClassINET}},
+		Questions: []dnsmessage.Question{{Name: name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}},
 	}
 	query, err := message.Pack()
 	if err != nil {
