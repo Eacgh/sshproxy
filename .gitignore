@@ -14,3 +14,4 @@ wintun.dll.tmp
 /network-state.json
 network-state.json.tmp
 *.log
+/.zcode/
