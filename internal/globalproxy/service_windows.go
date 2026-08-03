@@ -23,8 +23,7 @@ import (
 )
 
 const (
-	tunnelMTU     = 1500
-	tcpBufferSize = 4 << 20
+	tunnelMTU = 1500
 )
 
 var adapterGUID = windows.GUID{Data1: 0x6dcd3f96, Data2: 0x1df3, Data3: 0x4eec, Data4: [8]byte{0xb7, 0x86, 0x62, 0x89, 0x96, 0xe5, 0x31, 0x12}}
@@ -93,10 +92,11 @@ func (c *windowsController) Start(ctx context.Context) error {
 	networkStack, err := core.CreateStack(&core.Config{
 		LinkEndpoint:     device,
 		TransportHandler: transport,
+		// 使用 tun2socks 官方默认栈配置（reno 拥塞控制、关闭 Nagle、
+		// 开启 SACK、缓冲区 4K-4M 范围）。手写参数中 cubic 在 gvisor 的
+		// 高延迟链路上会吞吐停滞，官方默认配置经过生产验证。
 		Options: []option.Option{
-			option.WithTCPModerateReceiveBuffer(false),
-			option.WithTCPSendBufferSize(tcpBufferSize),
-			option.WithTCPReceiveBufferSize(tcpBufferSize),
+			option.WithDefault(),
 		},
 	})
 	if err != nil {
@@ -127,7 +127,7 @@ func (c *windowsController) Start(ctx context.Context) error {
 		"全局 TCP 代理已启用",
 		"虚拟网卡", adapterName,
 		"MTU", tunnelMTU,
-		"TCP缓冲", "4 MiB",
+		"TCP缓冲", "系统默认",
 		"中继缓冲", "128 KiB",
 		"域名解析", dnsMode,
 		"建连保护", "同目标限流和超时熔断",
