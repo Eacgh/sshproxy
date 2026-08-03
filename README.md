@@ -10,21 +10,23 @@
 SshVpn.exe          GUI 主程序
 sshvpn-core.exe     首次启动自动生成
 wintun.dll          首次启用全局模式时由核心自动生成
-config.json         点击“保存配置”时自动生成
+servers.json        服务器列表（可管理多条服务器）
+traffic.json        累计流量统计（可随时重置）
 known_hosts         首次成功连接时自动生成
 network-state.json  全局模式运行时用于异常恢复，正常断开后删除
 ```
 
 GUI 支持：
 
-- 编辑并保存连接配置，可选填写自定义上游 DNS。
+- 左侧服务器列表管理多条服务器配置，右侧编辑选中服务器的连接参数，可增删改。
 - 启动、正常停止 Go 核心并显示实时日志。
 - 使用 Wintun 接管 IPv4/IPv6 TCP 流量，并通过本地 Fake-IP 把域名交给 SSH 服务器解析。
 - 连接前恢复上次异常退出遗留的临时路由，断开时自动还原网络。
+- 左下角实时显示累计上行/下行流量，支持一键重置。
 - 点击最小化或右上角关闭按钮时隐藏到系统托盘，通过托盘连接、断开或真正退出。
 - 显示当前 SOCKS5 地址和运行状态。
 
-程序自己的配置、核心、日志和恢复状态都只保存在 EXE 同目录，不会写入 AppData 或用户目录。程序目录必须可写，请把便携版放在桌面或自选目录，不要放入 `Program Files`。更新 `SshVpn.exe` 后，GUI 会通过哈希比较自动更新同目录的核心，不会删除已有的 `config.json` 和 `known_hosts`。
+程序自己的配置、核心、日志和恢复状态都只保存在 EXE 同目录，不会写入 AppData 或用户目录。程序目录必须可写，请把便携版放在桌面或自选目录，不要放入 `Program Files`。更新 `SshVpn.exe` 后，GUI 会通过哈希比较自动更新同目录的核心，不会删除已有的 `servers.json` 和 `known_hosts`。
 
 全局模式需要管理员权限，GUI 启动时会显示 Windows UAC。虚拟网卡属于内核驱动，Windows 必须把官方签名的 Wintun 驱动安装到 Driver Store，并维护必要的设备注册表状态；这是虚拟网卡工作的系统要求。程序不会把用户配置写入这些位置。
 
@@ -45,32 +47,55 @@ GUI 默认勾选“启用全局模式（TCP）”。内部网络参数完全由�
 
 ## 配置
 
-GUI 中填写服务器、账号、密码和代理端口即可使用；如有需要也可以填写自定义上游 DNS。点击“保存配置”后自动生成 `config.json`：
+### GUI 模式：servers.json（多服务器列表）
+
+GUI 中点击“管理”可以增删服务器，左侧列表选中服务器后编辑账号、密码和代理端口，点击“保存配置”写入 `servers.json`：
 
 ```json
-{
-  "server_address": "ssh.example.com",
-  "username": "你的用户名",
-  "password": "你的密码",
-  "proxy_port": 1080
-}
+[
+  {
+    "name": "我的服务器",
+    "server_address": "ssh.example.com",
+    "username": "你的用户名",
+    "password": "你的密码",
+    "proxy_port": 1080
+  }
+]
 ```
 
+- `name`：服务器名称，用于列表显示和核心启动时按名称加载。
 - `server_address`：SSH 服务器域名或 IP。未填写端口时自动使用 `22`，其他端口可写成 `ssh.example.com:2222`。
 - `username`：SSH 登录用户名。
 - `password`：SSH 登录密码。
 - `proxy_port`：本机 SOCKS5 代理端口，省略时默认使用 `1080`。
-- `dns_server`：可选字段，仅全局模式使用。GUI 留空时不会写入配置，并由 SSH 服务器解析域名；填写 DNS 的 IP 或 `IP:端口` 后，程序会通过 SSH 使用 DNS-over-TCP 查询该地址，把其 IPv4 结果保存在 Fake-IP 映射中，并向 Windows 返回空 AAAA 以兼容没有 IPv6 出口的 SSH 服务器。为避免启动时还要解析 DNS 服务器自身，此处不接受域名。
+- `dns_server`：可选字段，仅全局模式使用。留空时由 SSH 服务器解析域名；填写 DNS 的 IP 或 `IP:端口` 后，程序会通过 SSH 使用 DNS-over-TCP 查询该地址，把其 IPv4 结果保存在 Fake-IP 映射中，并向 Windows 返回空 AAAA 以兼容没有 IPv6 出口的 SSH 服务器。为避免启动时还要解析 DNS 服务器自身，此处不接受域名。
+
+首次从旧版本升级时，GUI 会自动用已有的 `config.json` 生成一个默认服务器条目。
+
+### 命令行模式：config.json 或 servers.json + -profile
+
+不使用 GUI 时，核心既可以读取单文件 `config.json`，也可以配合 `-profile` 从服务器列表加载：
+
+```text
+sshvpn-core.exe -config config.json
+sshvpn-core.exe -profile 我的服务器
+```
 
 程序固定监听 `127.0.0.1`，连接超时、SSH 保活和主机密钥都由程序内部管理。首次连接时会自动记录服务器主机密钥；如果以后密钥发生变化，程序会拒绝连接并给出安全提示。
 
-`config.json` 含有明文密码，已经被 `.gitignore` 排除。不要提交、发送或公开该文件。
+`servers.json` 和 `config.json` 含有明文密码，已经被 `.gitignore` 排除。不要提交、发送或公开该文件。
 
 ## 运行
 
 ```powershell
 Copy-Item config.example.json config.json
 go run ./cmd/sshvpn -config config.json
+```
+
+也可以从服务器列表按名称加载：
+
+```powershell
+go run ./cmd/sshvpn -profile 我的服务器
 ```
 
 运行期间按 `Ctrl+C` 会关闭所有本地连接和 SSH 通道后正常退出。默认只显示连接状态；需要查看每条 SOCKS5 连接时使用：
@@ -83,6 +108,12 @@ go run ./cmd/sshvpn -config config.json -verbose
 
 ```text
 go run ./cmd/sshvpn -config config.json -global -verbose
+```
+
+清零累计流量统计（跨重启持久化在 `traffic.json`）：
+
+```text
+go run ./cmd/sshvpn -config config.json -reset-traffic
 ```
 
 另一个终端使用 `curl` 验证出口 IP：

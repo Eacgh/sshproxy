@@ -7,6 +7,10 @@
 /sshvpn.exe
 /config.json
 config.json.tmp
+/servers.json
+servers.json.tmp
+/traffic.json
+traffic.json.tmp
 known_hosts
 sshvpn-core.exe.tmp
 /wintun.dll
