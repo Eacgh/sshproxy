@@ -128,22 +128,14 @@ public partial class MainWindow : Window
         UpdateEndpointText(profile.ProxyPort);
     }
 
-    private async void ServerListBox_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    private void ServerListBox_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
     {
         if (_syncingServerSelection || ServerListBox.SelectedItem is not ServerProfile profile)
         {
             return;
         }
         ApplyProfileToForm(profile);
-        try
-        {
-            await _configService.SaveAsync(ServerProfileService.ToAppConfig(profile));
-            AddLog($"已切换到服务器：{profile.Name}");
-        }
-        catch (Exception ex)
-        {
-            AddLog($"保存服务器配置失败：{ex.Message}");
-        }
+        AddLog($"已切换到服务器：{profile.Name}");
     }
 
     private void ManageServersButton_Click(object sender, RoutedEventArgs e)
@@ -197,7 +189,8 @@ public partial class MainWindow : Window
             {
                 return;
             }
-            await _coreService.StartAsync(GlobalModeCheckBox.IsChecked == true);
+            var profileName = (ServerListBox.SelectedItem as ServerProfile)?.Name;
+            await _coreService.StartAsync(GlobalModeCheckBox.IsChecked == true, profileName: profileName);
         }
         catch (Exception ex)
         {
@@ -247,9 +240,9 @@ public partial class MainWindow : Window
             ProxyPort = proxyPort,
             DnsServer = string.IsNullOrEmpty(dnsServer) ? null : dnsServer
         };
-        await _configService.SaveAsync(config);
 
-        // 同步更新当前选中的服务器条目，保证列表与表单一致。
+        // 只更新服务器列表 servers.json，不再单独生成 config.json；
+        // 核心启动时通过 -profile 直接读取列表中的条目。
         if (ServerListBox.SelectedItem is ServerProfile current)
         {
             current.ServerAddress = config.ServerAddress;
@@ -261,7 +254,7 @@ public partial class MainWindow : Window
         }
 
         UpdateEndpointText(proxyPort);
-        AddLog("配置已保存到程序目录");
+        AddLog("配置已保存到服务器列表");
         return true;
     }
 
@@ -391,7 +384,8 @@ public partial class MainWindow : Window
                 // 核心运行中：停止后用 -reset-traffic 重新启动，让核心清零并持久化。
                 AddLog("正在重启核心以重置流量统计");
                 await _coreService.StopAsync();
-                await _coreService.StartAsync(GlobalModeCheckBox.IsChecked == true, resetTraffic: true);
+                var profileName = (ServerListBox.SelectedItem as ServerProfile)?.Name;
+                await _coreService.StartAsync(GlobalModeCheckBox.IsChecked == true, resetTraffic: true, profileName: profileName);
                 AddLog("已重置流量统计");
             }
             else

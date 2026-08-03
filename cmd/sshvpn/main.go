@@ -36,6 +36,7 @@ func run() error {
 		return err
 	}
 	configPath := flag.String("config", defaultConfigPath, "JSON 配置文件路径")
+	profile := flag.String("profile", "", "从服务器列表 servers.json 中按名称加载配置（与 -config 二选一）")
 	verbose := flag.Bool("verbose", false, "显示调试日志")
 	controlStdin := flag.Bool("control-stdin", false, "允许 GUI 通过标准输入停止程序")
 	globalMode := flag.Bool("global", false, "启用 Windows 全局 TCP 代理")
@@ -57,7 +58,14 @@ func run() error {
 		}
 	}
 
-	cfg, err := config.Load(*configPath)
+	var cfg config.Config
+	if *profile != "" {
+		// GUI 模式：直接从服务器列表加载指定条目，不再需要 config.json。
+		serversPath := filepath.Join(filepath.Dir(*configPath), "servers.json")
+		cfg, err = config.LoadProfile(serversPath, *profile)
+	} else {
+		cfg, err = config.Load(*configPath)
+	}
 	if err != nil {
 		return err
 	}
@@ -178,6 +186,8 @@ func configureUsage() {
 		fmt.Fprintln(output, "选项：")
 		fmt.Fprintln(output, "  -config <路径>")
 		fmt.Fprintln(output, "        JSON 配置文件路径（默认：config.json）")
+		fmt.Fprintln(output, "  -profile <名称>")
+		fmt.Fprintln(output, "        从 servers.json 服务器列表中按名称加载配置")
 		fmt.Fprintln(output, "  -verbose")
 		fmt.Fprintln(output, "        显示调试日志")
 		fmt.Fprintln(output, "  -control-stdin")

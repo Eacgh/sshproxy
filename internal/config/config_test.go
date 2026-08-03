@@ -105,3 +105,85 @@ func writeConfig(t *testing.T, content string) string {
 	}
 	return path
 }
+
+func writeServers(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "servers.json")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestLoadProfileFindsNamedServer(t *testing.T) {
+	path := writeServers(t, `[
+		{
+			"name": "服务器A",
+			"server_address": "a.example.com:2222",
+			"username": "alice",
+			"password": "secret",
+			"proxy_port": 2080,
+			"dns_server": "1.1.1.1"
+		},
+		{
+			"name": "服务器B",
+			"server_address": "b.example.com",
+			"username": "bob",
+			"password": "pw",
+			"proxy_port": 1080
+		}
+	]`)
+
+	cfg, err := LoadProfile(path, "服务器A")
+	if err != nil {
+		t.Fatalf("LoadProfile() 返回错误：%v", err)
+	}
+	if cfg.SSHAddress() != "a.example.com:2222" {
+		t.Fatalf("SSH 地址为 %q", cfg.SSHAddress())
+	}
+	if cfg.CustomDNSServer() != "1.1.1.1:53" {
+		t.Fatalf("自定义 DNS 为 %q", cfg.CustomDNSServer())
+	}
+	if cfg.SOCKSListen() != "127.0.0.1:2080" {
+		t.Fatalf("SOCKS5 监听地址为 %q", cfg.SOCKSListen())
+	}
+}
+
+func TestLoadProfileAppliesDefaultsForSecondServer(t *testing.T) {
+	path := writeServers(t, `[
+		{
+			"name": "服务器B",
+			"server_address": "b.example.com",
+			"username": "bob",
+			"password": "pw"
+		}
+	]`)
+
+	cfg, err := LoadProfile(path, "服务器B")
+	if err != nil {
+		t.Fatalf("LoadProfile() 返回错误：%v", err)
+	}
+	if cfg.SSHAddress() != "b.example.com:22" {
+		t.Fatalf("SSH 地址为 %q，期望补全默认端口", cfg.SSHAddress())
+	}
+	if cfg.SOCKSListen() != "127.0.0.1:1080" {
+		t.Fatalf("SOCKS5 监听地址为 %q", cfg.SOCKSListen())
+	}
+}
+
+func TestLoadProfileMissingNameReturnsError(t *testing.T) {
+	path := writeServers(t, `[
+		{"name": "A", "server_address": "a.example.com", "username": "u", "password": "p"}
+	]`)
+
+	if _, err := LoadProfile(path, "不存在的服务器"); err == nil {
+		t.Fatal("LoadProfile() 对不存在的名称应返回错误")
+	}
+}
+
+func TestLoadProfileMissingFileReturnsError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nonexistent.json")
+	if _, err := LoadProfile(path, "A"); err == nil {
+		t.Fatal("LoadProfile() 对缺失文件应返回错误")
+	}
+}
