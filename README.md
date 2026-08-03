@@ -145,3 +145,7 @@ go build -buildvcs=false -trimpath -ldflags="-s -w" -o bin/sshvpn.exe ./cmd/sshv
 ```
 
 全局模式仅支持 x64 Windows。内嵌的 tun2socks 使用 MIT 许可证；预编译 Wintun DLL 使用 WireGuard LLC 随官方压缩包提供的二进制许可证，原始许可证保存在 `internal/globalproxy/assets`。
+
+## 致谢
+
+感谢 [LINUX DO](https://linux.do) 社区提供的交流与推广平台。
