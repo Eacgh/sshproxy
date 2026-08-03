@@ -3,8 +3,11 @@ package globalproxy
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
+	"log/slog"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -47,7 +50,7 @@ func TestCustomDNSResolverQueriesInParallel(t *testing.T) {
 		return client, nil
 	})
 	cache := newDNSNameCache()
-	resolver := newCustomDNSResolver(dialer, "9.9.9.9:53", newFakeDNSResolver(cache), cache)
+	resolver := newCustomDNSResolver(dialer, "9.9.9.9:53", newFakeDNSResolver(cache), cache, slog.Default())
 	defer resolver.close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -187,4 +190,50 @@ func serveDelayedDNSResponse(connection net.Conn, response []byte, active, maxim
 	time.Sleep(100 * time.Millisecond)
 	binary.BigEndian.PutUint16(header, uint16(len(response)))
 	_, _ = connection.Write(append(header, response...))
+}
+
+// TestCustomDNSFallsBackToFakeIPOnUpstreamFailure 验证自定义 DNS 不可达时
+// 自动回退到 Fake-IP 解析，页面不会被卡死。
+func TestCustomDNSFallsBackToFakeIPOnUpstreamFailure(t *testing.T) {
+	name, err := dnsmessage.NewName("example.com.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := dnsmessage.Message{
+		Header:    dnsmessage.Header{ID: 3},
+		Questions: []dnsmessage.Question{{Name: name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}},
+	}
+	query, err := message.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	failing := dialerFunc(func(context.Context, string, string) (net.Conn, error) {
+		return nil, errors.New("服务器无法连接自定义 DNS")
+	})
+	cache := newDNSNameCache()
+	resolver := newCustomDNSResolver(failing, "223.5.5.5:53", newFakeDNSResolver(cache), cache, slog.Default())
+	defer resolver.close()
+
+	response, err := resolver.resolve(context.Background(), query)
+	if err != nil {
+		t.Fatalf("自定义 DNS 失败后应回退到 Fake-IP 而不是报错：%v", err)
+	}
+	var unpacked dnsmessage.Message
+	if err := unpacked.Unpack(response); err != nil {
+		t.Fatal(err)
+	}
+	if len(unpacked.Answers) != 1 {
+		t.Fatalf("回退应答应为 1 条 Fake-IP 回答，实际 %d", len(unpacked.Answers))
+	}
+	body, ok := unpacked.Answers[0].Body.(*dnsmessage.AResource)
+	if !ok {
+		t.Fatalf("回退应答类型为 %T", unpacked.Answers[0].Body)
+	}
+	address := netip.AddrFrom4(body.A)
+	if !isFakeAddress(address) {
+		t.Fatalf("回退应答不是 Fake-IP：%s", address)
+	}
+	if !resolver.unavailable.Load() {
+		t.Fatal("自定义 DNS 失败后未标记为不可用")
+	}
 }
