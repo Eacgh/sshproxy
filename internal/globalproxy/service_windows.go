@@ -88,7 +88,7 @@ func (c *windowsController) Start(ctx context.Context) error {
 		return fmt.Errorf("创建 Wintun 虚拟网卡失败：%w", err)
 	}
 
-	transport := newFastTransportHandler(c.options.Dialer, c.options.DNSServer, c.options.Logger)
+	transport := newFastTransportHandlerWithStats(c.options.Dialer, c.options.DNSServer, c.options.Logger, c.options.Traffic)
 	networkStack, err := core.CreateStack(&core.Config{
 		LinkEndpoint:     device,
 		TransportHandler: transport,

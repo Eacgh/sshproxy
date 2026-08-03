@@ -6,6 +6,8 @@ import (
 	"context"
 	"log/slog"
 	"net"
+
+	"sshvpn/internal/stats"
 )
 
 // Dialer 是全局转发层访问 SSH direct-tcpip 的最小接口。
@@ -25,4 +27,6 @@ type Options struct {
 	Dialer      Dialer
 	DNSServer   string
 	Logger      *slog.Logger
+	// Traffic 接收全局转发流量的统计对象；为 nil 时自动创建。
+	Traffic *stats.Traffic
 }

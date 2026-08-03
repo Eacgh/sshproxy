@@ -14,6 +14,8 @@ import (
 	M "github.com/xjasonlyu/tun2socks/v2/metadata"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
+
+	"sshvpn/internal/stats"
 )
 
 const (
@@ -39,6 +41,7 @@ type dialLogState struct {
 type fastTransportHandler struct {
 	transport *sshTransport
 	logger    *slog.Logger
+	stats     *stats.Traffic
 
 	mu          sync.Mutex
 	connections map[net.Conn]struct{}
@@ -50,12 +53,20 @@ type fastTransportHandler struct {
 }
 
 func newFastTransportHandler(dialer Dialer, dnsServer string, logger *slog.Logger) *fastTransportHandler {
+	return newFastTransportHandlerWithStats(dialer, dnsServer, logger, nil)
+}
+
+func newFastTransportHandlerWithStats(dialer Dialer, dnsServer string, logger *slog.Logger, traffic *stats.Traffic) *fastTransportHandler {
 	if logger == nil {
 		logger = slog.Default()
+	}
+	if traffic == nil {
+		traffic = new(stats.Traffic)
 	}
 	return &fastTransportHandler{
 		transport:   newSSHTransport(dialer, dnsServer, logger),
 		logger:      logger,
+		stats:       traffic,
 		connections: make(map[net.Conn]struct{}),
 		dialLogs:    make(map[string]dialLogState),
 	}
@@ -124,7 +135,7 @@ func (h *fastTransportHandler) handleTCP(origin adapter.TCPConn) {
 	}
 	h.logger.Debug("全局 TCP 通道已建立", "目标", forwardTarget)
 
-	relayTCP(origin, remote)
+	h.relayTCP(origin, remote)
 }
 
 func writeAll(connection net.Conn, payload []byte) error {
@@ -178,19 +189,24 @@ func localizedDialError(err error) string {
 	}
 }
 
-func relayTCP(origin, remote net.Conn) {
+func (h *fastTransportHandler) relayTCP(origin, remote net.Conn) {
 	done := make(chan struct{}, 2)
-	go copyTCP(remote, origin, done)
-	go copyTCP(origin, remote, done)
+	go h.copyTCP(remote, origin, done, true)  // 本机 -> 远端：上行
+	go h.copyTCP(origin, remote, done, false) // 远端 -> 本机：下行
 	<-done
 	<-done
 }
 
-func copyTCP(destination, source net.Conn, done chan<- struct{}) {
+func (h *fastTransportHandler) copyTCP(destination, source net.Conn, done chan<- struct{}, upload bool) {
 	defer func() { done <- struct{}{} }()
 	buffer := tcpBufferPool.Get().([]byte)
-	_, _ = io.CopyBuffer(destination, source, buffer)
+	bytes, _ := io.CopyBuffer(destination, source, buffer)
 	tcpBufferPool.Put(buffer)
+	if upload {
+		h.stats.Add(uint64(bytes), 0)
+	} else {
+		h.stats.Add(0, uint64(bytes))
+	}
 	if closeReader, ok := source.(interface{ CloseRead() error }); ok {
 		_ = closeReader.CloseRead()
 	}

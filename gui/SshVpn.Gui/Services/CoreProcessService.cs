@@ -28,7 +28,7 @@ internal sealed class CoreProcessService(PortablePaths paths) : IAsyncDisposable
 
     public event EventHandler<CoreState>? StateChanged;
 
-    public async Task StartAsync(bool globalMode)
+    public async Task StartAsync(bool globalMode, bool resetTraffic = false)
     {
         await _gate.WaitAsync();
         try
@@ -58,6 +58,10 @@ internal sealed class CoreProcessService(PortablePaths paths) : IAsyncDisposable
             startInfo.ArgumentList.Add(paths.ConfigPath);
             startInfo.ArgumentList.Add("-verbose");
             startInfo.ArgumentList.Add("-control-stdin");
+            if (resetTraffic)
+            {
+                startInfo.ArgumentList.Add("-reset-traffic");
+            }
             if (globalMode)
             {
                 startInfo.ArgumentList.Add("-global");

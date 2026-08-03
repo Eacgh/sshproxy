@@ -2,7 +2,9 @@ package globalproxy
 
 import (
 	"bytes"
+	"context"
 	"io"
+	"log/slog"
 	"net"
 	"testing"
 	"time"
@@ -36,9 +38,14 @@ func TestRelayTCPTransfersBothDirections(t *testing.T) {
 	defer originClient.Close()
 	defer remoteServer.Close()
 
+	handler := newFastTransportHandlerWithStats(dialerFunc(func(context.Context, string, string) (net.Conn, error) {
+		t.Fatal("中继测试不应建立 SSH 通道")
+		return nil, nil
+	}), "", slog.Default(), nil)
+
 	relayDone := make(chan struct{})
 	go func() {
-		relayTCP(originTunnel, remoteTunnel)
+		handler.relayTCP(originTunnel, remoteTunnel)
 		close(relayDone)
 	}()
 
@@ -82,5 +89,11 @@ func TestRelayTCPTransfersBothDirections(t *testing.T) {
 	case <-relayDone:
 	case <-time.After(3 * time.Second):
 		t.Fatal("双向中继没有正常退出")
+	}
+
+	// 验证上下行统计：上传 = len(upload)，下载 = len(download)。
+	uploadStats, downloadStats := handler.stats.Snapshot()
+	if uploadStats != uint64(len(upload)) || downloadStats != uint64(len(download)) {
+		t.Fatalf("流量统计 = %d/%d，期望 %d/%d", uploadStats, downloadStats, len(upload), len(download))
 	}
 }

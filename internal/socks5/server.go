@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"sshvpn/internal/stats"
 )
 
 const (
@@ -42,6 +44,7 @@ type Server struct {
 	dialTimeout time.Duration
 	dialer      Dialer
 	logger      *slog.Logger
+	stats       *stats.Traffic
 
 	mu          sync.Mutex
 	listener    net.Listener
@@ -52,6 +55,12 @@ type Server struct {
 
 // New 创建只允许绑定到本机回环地址的 SOCKS5 服务。
 func New(listenAddr string, dialTimeout time.Duration, dialer Dialer, logger *slog.Logger) (*Server, error) {
+	return NewWithStats(listenAddr, dialTimeout, dialer, logger, nil)
+}
+
+// NewWithStats 与 New 相同，但接收可选的流量统计对象；
+// 传入 nil 时自动创建，保证统计永远可用。
+func NewWithStats(listenAddr string, dialTimeout time.Duration, dialer Dialer, logger *slog.Logger, traffic *stats.Traffic) (*Server, error) {
 	if err := ValidateListenAddress(listenAddr); err != nil {
 		return nil, err
 	}
@@ -64,9 +73,12 @@ func New(listenAddr string, dialTimeout time.Duration, dialer Dialer, logger *sl
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if traffic == nil {
+		traffic = new(stats.Traffic)
+	}
 	return &Server{
 		listenAddr: listenAddr, dialTimeout: dialTimeout, dialer: dialer,
-		logger: logger, connections: make(map[net.Conn]struct{}),
+		logger: logger, stats: traffic, connections: make(map[net.Conn]struct{}),
 	}, nil
 }
 
@@ -209,7 +221,7 @@ func (s *Server) handle(client net.Conn) {
 		return
 	}
 	s.logger.Debug("SOCKS5 隧道已建立", "目标", target)
-	proxy(client, remote)
+	s.proxy(client, remote)
 }
 
 func negotiate(conn net.Conn) error {
@@ -319,18 +331,24 @@ func classifyDialError(err error) byte {
 }
 
 // proxy 同时复制两个方向的数据，并在单向结束时发送半关闭信号。
-func proxy(client, remote net.Conn) {
+// 复制过程中统计实际转发的用户流量字节数。
+func (s *Server) proxy(client, remote net.Conn) {
 	done := make(chan struct{}, 2)
-	copyOneWay := func(dst, src net.Conn) {
-		_, _ = io.Copy(dst, src)
+	copyOneWay := func(dst, src net.Conn, upload bool) {
+		bytes, _ := io.Copy(dst, src)
+		if upload {
+			s.stats.Add(uint64(bytes), 0)
+		} else {
+			s.stats.Add(0, uint64(bytes))
+		}
 		// 半关闭允许对端在请求体结束后继续返回剩余响应数据。
 		if closeWriter, ok := dst.(interface{ CloseWrite() error }); ok {
 			_ = closeWriter.CloseWrite()
 		}
 		done <- struct{}{}
 	}
-	go copyOneWay(remote, client)
-	go copyOneWay(client, remote)
+	go copyOneWay(remote, client, true)  // 本机 -> 远端：上行
+	go copyOneWay(client, remote, false) // 远端 -> 本机：下行
 	<-done
 	<-done
 }

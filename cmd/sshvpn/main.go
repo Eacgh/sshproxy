@@ -20,6 +20,7 @@ import (
 	"sshvpn/internal/portable"
 	"sshvpn/internal/socks5"
 	"sshvpn/internal/sshclient"
+	"sshvpn/internal/stats"
 )
 
 func main() {
@@ -38,6 +39,7 @@ func run() error {
 	verbose := flag.Bool("verbose", false, "显示调试日志")
 	controlStdin := flag.Bool("control-stdin", false, "允许 GUI 通过标准输入停止程序")
 	globalMode := flag.Bool("global", false, "启用 Windows 全局 TCP 代理")
+	resetTraffic := flag.Bool("reset-traffic", false, "清零累计流量统计")
 	configureUsage()
 	flag.Parse()
 
@@ -59,6 +61,33 @@ func run() error {
 	if err != nil {
 		return err
 	}
+
+	// 流量统计：从程序目录加载累计值，-reset-traffic 时清零；
+	// 退出前把最新累计值写回，实现跨重启累计。
+	trafficPath, err := portable.File("traffic.json")
+	if err != nil {
+		return err
+	}
+	traffic := new(stats.Traffic)
+	if *resetTraffic {
+		if err := stats.RemoveTraffic(trafficPath); err != nil {
+			return err
+		}
+		logger.Info("已清零累计流量统计")
+	} else {
+		upload, download, err := stats.LoadTraffic(trafficPath)
+		if err != nil {
+			return err
+		}
+		traffic.Restore(upload, download)
+	}
+	defer func() {
+		upload, download := traffic.Snapshot()
+		if err := stats.SaveTraffic(trafficPath, upload, download); err != nil {
+			logger.Warn("保存流量统计失败", "错误", err)
+		}
+	}()
+
 	manager, err := sshclient.NewManager(cfg, logger)
 	if err != nil {
 		return err
@@ -69,6 +98,7 @@ func run() error {
 	defer stopSignals()
 	ctx, cancelRun := context.WithCancel(signalCtx)
 	defer cancelRun()
+	go stats.RunReporter(ctx, traffic, logger)
 	if *controlStdin {
 		go watchControlInput(os.Stdin, cancelRun, logger)
 	}
@@ -79,7 +109,7 @@ func run() error {
 		return err
 	}
 
-	server, err := socks5.New(cfg.SOCKSListen(), cfg.ConnectTimeout(), manager, logger)
+	server, err := socks5.NewWithStats(cfg.SOCKSListen(), cfg.ConnectTimeout(), manager, logger, traffic)
 	if err != nil {
 		return err
 	}
@@ -101,6 +131,7 @@ func run() error {
 			Dialer:      manager,
 			DNSServer:   cfg.CustomDNSServer(),
 			Logger:      logger,
+			Traffic:     traffic,
 		})
 		if err := globalController.Start(ctx); err != nil {
 			listener.Close()
@@ -153,6 +184,8 @@ func configureUsage() {
 		fmt.Fprintln(output, "        允许 GUI 通过标准输入停止程序")
 		fmt.Fprintln(output, "  -global")
 		fmt.Fprintln(output, "        启用 Windows 全局 TCP 代理（需要管理员权限）")
+		fmt.Fprintln(output, "  -reset-traffic")
+		fmt.Fprintln(output, "        清零累计流量统计")
 	}
 }
 
