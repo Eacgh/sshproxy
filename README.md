@@ -38,7 +38,7 @@ GUI 默认勾选“启用全局模式（TCP）”。内部网络参数完全由�
 4. IPv4 和 IPv6 分别使用两个 `/1` 路由接管流量，不删除用户原有默认路由。
 5. 自动记录当前 DNS 地址并添加临时主机路由，然后在本机返回保留范围内的 Fake-IP。默认模式不访问公共 DNS，真实域名只交给 SSH 服务器解析；自定义模式通过 SSH 查询用户指定的 DNS，但仍只向 Windows 返回 Fake-IP，并优先使用其 IPv4 结果。启用和断开时会自动清理 Windows DNS 缓存。
 6. TCP 连接根据 Fake-IP 恢复域名或自定义 DNS 的真实 IPv4；绕过系统 DNS 的 HTTPS 则根据 TLS ClientHello 中公开的 SNI 回退，避免浏览器缓存的旧 Fake-IP 被发往远端。程序不会解密或修改 TLS 内容。
-7. 同一目标一次只探测一条 SSH 通道，全局最多同时探测 12 个目标；目标超时后从 1 分钟开始指数延长暂停时间并合并重复日志，避免大量不可达的后台连接拖慢正在使用的网站。已经建立的连接不占探测名额，不会限制正常下载吞吐。
+7. 同一目标允许少量并发探测，全局最多同时探测 12 个目标；目标超时后从 5 秒开始指数延长暂停时间（最多 1 分钟）并合并重复日志，避免大量不可达的后台连接拖慢正在使用的网站。已经建立的连接不占探测名额，不会限制正常下载吞吐。
 8. 断开时删除临时地址和路由；异常退出后在下次连接前根据 `network-state.json` 自动恢复。
 
 当前阶段普通 UDP 会被明确阻止，不会绕过 SSH。浏览器的 QUIC 通常会自动回退到 TCP；游戏、语音通话以及依赖 UDP 的软件可能无法使用。取消勾选全局模式后，程序只提供原来的 SOCKS5 代理。
@@ -93,17 +93,21 @@ curl.exe --proxy socks5h://127.0.0.1:1080 https://ip.me/
 
 ## 构建单文件 GUI
 
-需要 Go 1.26 和 .NET 10 SDK。构建不依赖 PowerShell 脚本，顺序固定为“先核心，后 GUI”。在仓库根目录依次执行：
+需要 Go 1.26 和 .NET 10 SDK。顺序固定为“先核心，后 GUI”，且必须在 `dotnet publish` 之前给核心签名——GUI 会把签名后的核心原样嵌入，运行时解压出的核心才会被系统应用控制放行。在仓库根目录依次执行：
 
 ```text
 go test -buildvcs=false ./...
 go build -buildvcs=false -trimpath -ldflags="-s -w" -o gui/SshVpn.Gui/Resources/sshvpn-core.exe ./cmd/sshvpn
+powershell -ExecutionPolicy Bypass -File scripts/sign-core.ps1
 dotnet publish gui/SshVpn.Gui/SshVpn.Gui.csproj -p:PublishProfile=Portable
+powershell -ExecutionPolicy Bypass -File scripts/sign-core.ps1 -GuiPath artifacts\sshvpn-portable\SshVpn.exe
 ```
 
 发布结果位于 `artifacts\sshvpn-portable\SshVpn.exe`。第一次发布可能从 NuGet 下载 .NET 单文件发布所需的运行包，仓库中的 `NuGet.Config` 会把缓存固定到 `.cache\nuget`，不会写入用户 NuGet 目录。
 
 如果 Go 核心没有先生成，`dotnet publish` 会用中文错误明确中止，不会产出缺少核心的 GUI。
+
+> **代码签名**：部分 Windows 会启用应用控制（Device Guard / Smart App Control）策略，要求可执行文件满足企业签名级别。核心必须在 `dotnet publish` **之前**签名，否则 GUI 内嵌的会是未签名核心，运行时解压出来直接被系统阻止（表现为 GUI 报“应用程序控制策略已阻止此文件”）。`scripts/sign-core.ps1` 用本机自签名证书给核心和发布后的 GUI 签名，并把证书根加入当前用户受信任根。证书首次生成后复用，之后每次编译重新运行签名脚本即可。自签名证书只解决本机应用控制放行，发给其他机器仍可能提示“未知发布者”。
 
 ## 单独构建 Go 核心
 
