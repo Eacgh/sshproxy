@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"sync"
@@ -26,13 +27,21 @@ type customDNSResolver struct {
 	next     atomic.Uint32
 	fake     *fakeDNSResolver
 	cache    *dnsNameCache
+	logger   *slog.Logger
+	// unavailable 表示自定义 DNS 曾经查询失败，之后所有查询直接回退到
+	// Fake-IP（域名交给 SSH 服务器解析），避免每个查询都白等超时。
+	unavailable atomic.Bool
 }
 
-func newCustomDNSResolver(dialer Dialer, address string, fake *fakeDNSResolver, cache *dnsNameCache) *customDNSResolver {
+func newCustomDNSResolver(dialer Dialer, address string, fake *fakeDNSResolver, cache *dnsNameCache, logger *slog.Logger) *customDNSResolver {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	resolver := &customDNSResolver{
 		forwards: make([]*forwardingDNSResolver, customDNSConnections),
 		fake:     fake,
 		cache:    cache,
+		logger:   logger,
 	}
 	for index := range resolver.forwards {
 		resolver.forwards[index] = &forwardingDNSResolver{dialer: dialer, address: address}
@@ -42,7 +51,11 @@ func newCustomDNSResolver(dialer Dialer, address string, fake *fakeDNSResolver, 
 
 // resolve 使用用户指定的 DNS 获得真实 IPv4，但只向 Windows 返回 Fake-IP。
 // AAAA 和其他扩展记录返回空回答，避免远端没有 IPv6 时浏览器被真实 AAAA 卡住。
+// 自定义 DNS 不可达时自动回退到 Fake-IP（域名交给 SSH 服务器解析），不阻塞页面。
 func (r *customDNSResolver) resolve(ctx context.Context, payload []byte) ([]byte, error) {
+	if r.unavailable.Load() {
+		return r.fake.resolve(payload)
+	}
 	var query dnsmessage.Message
 	if err := query.Unpack(payload); err != nil {
 		return nil, fmt.Errorf("解析自定义 DNS 查询失败：%w", err)
@@ -58,7 +71,11 @@ func (r *customDNSResolver) resolve(ctx context.Context, payload []byte) ([]byte
 	forward := r.forwards[(r.next.Add(1)-1)%uint32(len(r.forwards))]
 	upstreamPayload, err := forward.resolve(ctx, payload)
 	if err != nil {
-		return nil, err
+		// 经 SSH 查询自定义 DNS 失败（服务器到该 DNS 不可达），降级为
+		// 域名交给 SSH 服务器解析，保证页面仍然可用。
+		r.unavailable.Store(true)
+		r.logger.Warn("自定义 DNS 经 SSH 查询失败，已回退到 SSH 服务器解析域名", "错误", err)
+		return r.fake.resolve(payload)
 	}
 	var upstream dnsmessage.Message
 	if err := upstream.Unpack(upstreamPayload); err != nil {
@@ -229,11 +246,28 @@ func (r *forwardingDNSResolver) close() error {
 	return err
 }
 
+// exchangeDNS 通过 SSH 通道交换一次 DNS-over-TCP 报文。
+// SSH 通道不支持 SetDeadline（ssh: tcpChan: deadline not supported），
+// 因此用带超时的上下文配合后台协程实现查询时限，超时后由调用方关闭通道。
 func exchangeDNS(ctx context.Context, connection net.Conn, payload []byte) ([]byte, error) {
-	deadline, _ := ctx.Deadline()
-	if err := connection.SetDeadline(deadline); err != nil {
-		return nil, err
+	type result struct {
+		response []byte
+		err      error
 	}
+	resultCh := make(chan result, 1)
+	go func() {
+		response, err := doExchangeDNS(connection, payload)
+		resultCh <- result{response: response, err: err}
+	}()
+	select {
+	case result := <-resultCh:
+		return result.response, result.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func doExchangeDNS(connection net.Conn, payload []byte) ([]byte, error) {
 	header := make([]byte, 2)
 	packet := make([]byte, 2+len(payload))
 	binary.BigEndian.PutUint16(packet, uint16(len(payload)))

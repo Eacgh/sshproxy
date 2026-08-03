@@ -41,7 +41,7 @@ func newSSHTransport(dialer Dialer, dnsServer string, logger *slog.Logger) *sshT
 		dialGuard: newDialGuard(),
 	}
 	if dnsServer != "" {
-		transport.customDNS = newCustomDNSResolver(dialer, dnsServer, transport.fakeDNS, dnsNames)
+		transport.customDNS = newCustomDNSResolver(dialer, dnsServer, transport.fakeDNS, dnsNames, logger)
 	}
 	return transport
 }
