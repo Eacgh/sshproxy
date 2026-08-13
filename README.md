@@ -14,6 +14,7 @@ servers.json        服务器列表（可管理多条服务器）
 traffic.json        累计流量统计（可随时重置）
 known_hosts         首次成功连接时自动生成
 network-state.json  全局模式运行时用于异常恢复，正常断开后删除
+logs/               每次启动生成 日期-标识.log 运行日志，便于排查问题
 ```
 
 GUI 支持：

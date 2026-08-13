@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -14,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"sshvpn/internal/config"
 	"sshvpn/internal/globalproxy"
@@ -30,7 +33,7 @@ func main() {
 	}
 }
 
-func run() error {
+func run() (returned error) {
 	defaultConfigPath, err := portable.File("config.json")
 	if err != nil {
 		return err
@@ -48,10 +51,22 @@ func run() error {
 	if *verbose {
 		level = slog.LevelDebug
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level:       level,
-		ReplaceAttr: localizeLogAttribute,
-	}))
+	handlerOptions := &slog.HandlerOptions{Level: level, ReplaceAttr: localizeLogAttribute}
+	// 日志双写：控制台（GUI 通过它解析日志）与程序目录 logs/ 下的本地文件。
+	handlers := []slog.Handler{slog.NewTextHandler(os.Stderr, handlerOptions)}
+	if logFile, err := openLogFile(); err != nil {
+		slog.New(handlers[0]).Warn("无法创建本地日志文件，本次仅输出到控制台", "错误", err)
+	} else {
+		handlers = append(handlers, slog.NewTextHandler(logFile, handlerOptions))
+	}
+	logger := slog.New(slog.NewMultiHandler(handlers...))
+	// 之后发生的启动失败也写入本地日志文件，方便离线排查；
+	// 控制台仍然由 main 输出统一的“sshvpn 运行失败”提示。
+	defer func() {
+		if returned != nil {
+			logger.Error("sshvpn 运行失败", "错误", returned)
+		}
+	}()
 	if *globalMode {
 		if err := globalproxy.Recover(logger); err != nil {
 			return err
@@ -176,6 +191,34 @@ func watchControlInput(reader io.Reader, cancel context.CancelFunc, logger *slog
 	if err := scanner.Err(); err != nil {
 		logger.Warn("读取 GUI 控制命令失败", "错误", err)
 	}
+}
+
+// openLogFile 在程序目录创建 logs 子目录，并打开本次启动的日志文件。
+// 文件名格式为 logs/日期-随机标识.log，多次启动互不覆盖，便于按会话排查。
+func openLogFile() (*os.File, error) {
+	directory, err := portable.Directory()
+	if err != nil {
+		return nil, err
+	}
+	logsDirectory := filepath.Join(directory, "logs")
+	if err := os.MkdirAll(logsDirectory, 0o755); err != nil {
+		return nil, err
+	}
+	identifier, err := randomIdentifier()
+	if err != nil {
+		return nil, err
+	}
+	name := time.Now().Format("2006-01-02") + "-" + identifier + ".log"
+	return os.OpenFile(filepath.Join(logsDirectory, name), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+}
+
+// randomIdentifier 生成短随机十六进制标识作为日志文件名后缀。
+func randomIdentifier() (string, error) {
+	var buffer [6]byte
+	if _, err := rand.Read(buffer[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buffer[:]), nil
 }
 
 // configureUsage 用中文输出命令行帮助，避免标准 flag 帮助混入英文标题。
