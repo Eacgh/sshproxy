@@ -29,6 +29,10 @@ public partial class MainWindow : Window
     private bool _allowClose;
     private bool _closing;
     private bool _windowLoaded;
+    // 表单编辑态：保存后右侧表单进入锁定态，字段用统一占位符遮挡，
+    // 点击“编辑”才填入完整内容。锁定态下“保存配置”被禁用，“连接”直接可用。
+    private bool _formEditing;
+    private const string MaskedText = "••••••••";
 
     public MainWindow()
     {
@@ -98,6 +102,11 @@ public partial class MainWindow : Window
         ServerListBox.SelectedIndex = _profiles.Count > 0 ? 0 : -1;
         _syncingServerSelection = false;
 
+        if (ServerListBox.SelectedItem is ServerProfile first)
+        {
+            ApplyProfileToForm(first);
+        }
+
         if (_profiles.Count == 0)
         {
             // 没有任何服务器时，仍尝试读取 config.json 填充表单（保持旧行为）。
@@ -108,17 +117,27 @@ public partial class MainWindow : Window
             ProxyPortBox.Text = config.ProxyPort.ToString();
             DnsServerBox.Text = config.DnsServer ?? string.Empty;
             UpdateEndpointText(config.ProxyPort);
+            // 没有可锁定的已保存配置，保持可编辑以便用户录入首个服务器。
+            SetFormEditing(true);
             AddLog(File.Exists(_paths.ConfigPath) ? "已读取同目录配置" : "尚未创建配置文件");
         }
     }
 
-    // ApplyProfileToForm 把选中服务器刷新到表单。
+    // ApplyProfileToForm 在选中服务器时刷新锁定态显示：
+    // 完整内容必须点击“编辑”后才会填入表单。
     private void ApplyProfileToForm(ServerProfile? profile)
     {
         if (profile == null)
         {
             return;
         }
+        LockForm();
+        UpdateEndpointText(profile.ProxyPort);
+    }
+
+    // LoadProfileToEditor 点击“编辑”时把选中服务器的真实内容填入表单。
+    private void LoadProfileToEditor(ServerProfile profile)
+    {
         ServerAddressBox.Text = profile.ServerAddress;
         UsernameBox.Text = profile.Username;
         PasswordInput.Password = profile.Password;
@@ -126,6 +145,50 @@ public partial class MainWindow : Window
         ProxyPortBox.Text = profile.ProxyPort.ToString();
         DnsServerBox.Text = profile.DnsServer ?? string.Empty;
         UpdateEndpointText(profile.ProxyPort);
+        SetFormEditing(true);
+    }
+
+    // LockForm 进入锁定态：全部字段替换为统一占位符，不泄露内容与长度；
+    // 密码明文开关一并复位，避免切换服务器后残留明文显示。
+    private void LockForm()
+    {
+        ServerAddressBox.Text = MaskedText;
+        UsernameBox.Text = MaskedText;
+        PasswordInput.Password = MaskedText;
+        VisiblePasswordInput.Text = MaskedText;
+        ProxyPortBox.Text = MaskedText;
+        DnsServerBox.Text = MaskedText;
+        ShowPasswordCheckBox.IsChecked = false;
+        SetFormEditing(false);
+    }
+
+    private void SetFormEditing(bool editing)
+    {
+        _formEditing = editing;
+        RefreshFormEnabled();
+    }
+
+    // 表单控件可用性 = 未在运行中 && 处于编辑态；锁定态只能“编辑”和“连接”。
+    private void RefreshFormEnabled()
+    {
+        var running = _coreService.State is CoreState.Starting or CoreState.Connected or CoreState.Stopping;
+        ServerAddressBox.IsEnabled = !running && _formEditing;
+        UsernameBox.IsEnabled = !running && _formEditing;
+        PasswordInput.IsEnabled = !running && _formEditing;
+        VisiblePasswordInput.IsEnabled = !running && _formEditing;
+        ProxyPortBox.IsEnabled = !running && _formEditing;
+        DnsServerBox.IsEnabled = !running && _formEditing;
+        ShowPasswordCheckBox.IsEnabled = !running && _formEditing;
+        SaveButton.IsEnabled = !running && _formEditing;
+        EditButton.IsEnabled = !running && !_formEditing;
+    }
+
+    private void EditButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (ServerListBox.SelectedItem is ServerProfile profile)
+        {
+            LoadProfileToEditor(profile);
+        }
     }
 
     private void ServerListBox_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
@@ -210,6 +273,11 @@ public partial class MainWindow : Window
     private async Task<bool> SaveConfigAsync()
     {
         HideValidation();
+        if (!_formEditing)
+        {
+            // 锁定态下表单没有可修改的内容，配置已经是保存过的状态，直接放行连接。
+            return true;
+        }
         if (string.IsNullOrWhiteSpace(ServerAddressBox.Text))
         {
             ShowValidation("请填写服务器地址");
@@ -278,6 +346,8 @@ public partial class MainWindow : Window
             : _profiles.Count > 0 ? _profiles.Count - 1 : -1;
         _syncingServerSelection = false;
 
+        // 保存成功后回到锁定态，右侧表单重新被占位符遮挡。
+        LockForm();
         UpdateEndpointText(proxyPort);
         AddLog("配置已保存到服务器列表");
         return true;
@@ -318,16 +388,9 @@ public partial class MainWindow : Window
         _trayIcon.Text = $"SSH VPN - {text}";
 
         var running = state is CoreState.Starting or CoreState.Connected or CoreState.Stopping;
-        ServerAddressBox.IsEnabled = !running;
-        UsernameBox.IsEnabled = !running;
-        PasswordInput.IsEnabled = !running;
-        VisiblePasswordInput.IsEnabled = !running;
-        ProxyPortBox.IsEnabled = !running;
-        DnsServerBox.IsEnabled = !running;
-        ShowPasswordCheckBox.IsEnabled = !running;
         GlobalModeCheckBox.IsEnabled = !running;
-        SaveButton.IsEnabled = !running;
         ConnectButton.IsEnabled = state != CoreState.Stopping;
+        RefreshFormEnabled();
 
         var canDisconnect = state is CoreState.Starting or CoreState.Connected;
         ConnectButtonText.Text = canDisconnect ? "断开" : "连接";

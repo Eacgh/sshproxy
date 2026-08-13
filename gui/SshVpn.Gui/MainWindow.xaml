@@ -164,12 +164,20 @@
                                     <ColumnDefinition Width="*" />
                                     <ColumnDefinition Width="Auto" />
                                 </Grid.ColumnDefinitions>
-                                <Button x:Name="SaveButton" AutomationProperties.AutomationId="SaveButton" AutomationProperties.Name="保存配置" Style="{StaticResource SecondaryButton}" Click="SaveButton_Click">
-                                    <StackPanel Orientation="Horizontal">
-                                        <TextBlock Text="&#xE74E;" FontFamily="Segoe Fluent Icons" Margin="0,0,8,0" />
-                                        <TextBlock Text="保存配置" />
-                                    </StackPanel>
-                                </Button>
+                                <StackPanel Orientation="Horizontal">
+                                    <Button x:Name="EditButton" AutomationProperties.AutomationId="EditButton" AutomationProperties.Name="编辑服务器" Style="{StaticResource SecondaryButton}" Click="EditButton_Click">
+                                        <StackPanel Orientation="Horizontal">
+                                            <TextBlock Text="&#xE70F;" FontFamily="Segoe Fluent Icons" Margin="0,0,8,0" />
+                                            <TextBlock Text="编辑" />
+                                        </StackPanel>
+                                    </Button>
+                                    <Button x:Name="SaveButton" AutomationProperties.AutomationId="SaveButton" AutomationProperties.Name="保存配置" Style="{StaticResource SecondaryButton}" Margin="8,0,0,0" Click="SaveButton_Click">
+                                        <StackPanel Orientation="Horizontal">
+                                            <TextBlock Text="&#xE74E;" FontFamily="Segoe Fluent Icons" Margin="0,0,8,0" />
+                                            <TextBlock Text="保存配置" />
+                                        </StackPanel>
+                                    </Button>
+                                </StackPanel>
                                 <Button x:Name="ConnectButton" AutomationProperties.AutomationId="ConnectButton" AutomationProperties.Name="连接或断开" Grid.Column="2" Style="{StaticResource PrimaryButton}" Click="ConnectButton_Click" MinWidth="112">
                                     <StackPanel Orientation="Horizontal">
                                         <TextBlock x:Name="ConnectButtonIcon" Text="&#xE768;" FontFamily="Segoe Fluent Icons" Margin="0,0,8,0" />
