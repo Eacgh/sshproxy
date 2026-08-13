@@ -164,7 +164,15 @@ public partial class MainWindow : Window
 
     private async void SaveButton_Click(object sender, RoutedEventArgs e)
     {
-        await SaveConfigAsync();
+        try
+        {
+            await SaveConfigAsync();
+        }
+        catch (Exception ex)
+        {
+            ShowValidation(ex.Message);
+            AddLog(ex.Message);
+        }
     }
 
     private async void ConnectButton_Click(object sender, RoutedEventArgs e)
@@ -250,8 +258,25 @@ public partial class MainWindow : Window
             current.Password = config.Password;
             current.ProxyPort = config.ProxyPort;
             current.DnsServer = config.DnsServer;
-            await _serverService.SaveAsync(_profiles);
         }
+        else
+        {
+            // 列表为空：把表单内容保存为新条目，避免修改悄悄丢失，
+            // 也保证连接时始终有 -profile 可用，不会因缺少 config.json 失败。
+            _profiles.Add(ServerProfileService.FromAppConfig(config));
+        }
+        await _serverService.SaveAsync(_profiles);
+
+        // 重新绑定列表以刷新显示（ServerProfile 未实现属性变更通知），
+        // 并保持当前选中项；无选中时选中刚创建的最后一项。
+        var selectedIndex = ServerListBox.SelectedIndex;
+        _syncingServerSelection = true;
+        ServerListBox.ItemsSource = null;
+        ServerListBox.ItemsSource = _profiles;
+        ServerListBox.SelectedIndex = selectedIndex >= 0 && selectedIndex < _profiles.Count
+            ? selectedIndex
+            : _profiles.Count > 0 ? _profiles.Count - 1 : -1;
+        _syncingServerSelection = false;
 
         UpdateEndpointText(proxyPort);
         AddLog("配置已保存到服务器列表");

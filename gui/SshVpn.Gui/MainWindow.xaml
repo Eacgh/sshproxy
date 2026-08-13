@@ -69,10 +69,7 @@
                             <ListBox x:Name="ServerListBox" AutomationProperties.AutomationId="ServerListBox" Grid.Row="1" SelectionChanged="ServerListBox_SelectionChanged" BorderThickness="0" Background="Transparent">
                                 <ListBox.ItemTemplate>
                                     <DataTemplate>
-                                        <StackPanel>
-                                            <TextBlock Text="{Binding Name}" FontWeight="SemiBold" />
-                                            <TextBlock Text="{Binding ServerAddress}" FontSize="11" Foreground="{StaticResource MutedBrush}" TextTrimming="CharacterEllipsis" />
-                                        </StackPanel>
+                                        <TextBlock Text="{Binding Name}" FontWeight="SemiBold" />
                                     </DataTemplate>
                                 </ListBox.ItemTemplate>
                             </ListBox>

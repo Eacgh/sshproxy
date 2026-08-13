@@ -72,6 +72,15 @@ internal partial class ServerEditWindow : Window
         Profile.Password = PasswordInput.Password;
         Profile.ProxyPort = proxyPort;
         Profile.DnsServer = string.IsNullOrEmpty(dnsServer) ? null : dnsServer;
+
+        // 把编辑结果写回原对象：列表持有 _profiles 中的原始对象引用，
+        // 只更新副本会导致列表和主窗口表单都看不到修改。
+        _original.Name = Profile.Name;
+        _original.ServerAddress = Profile.ServerAddress;
+        _original.Username = Profile.Username;
+        _original.Password = Profile.Password;
+        _original.ProxyPort = Profile.ProxyPort;
+        _original.DnsServer = Profile.DnsServer;
         DialogResult = true;
     }
 
