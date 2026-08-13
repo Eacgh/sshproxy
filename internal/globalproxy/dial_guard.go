@@ -105,7 +105,8 @@ func (g *dialGuard) record(target string, err error) {
 		return
 	}
 	state.timeoutFailures++
-	multiplier := 1 << min(state.timeoutFailures-1, 3)
+	// 5s、10s、20s、40s、60s（16 倍后按上限截断），最多暂停 1 分钟。
+	multiplier := 1 << min(state.timeoutFailures-1, 4)
 	cooldown := time.Duration(multiplier) * targetTimeoutInitialCooldown
 	if cooldown > targetTimeoutMaximumCooldown {
 		cooldown = targetTimeoutMaximumCooldown

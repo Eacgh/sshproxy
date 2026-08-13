@@ -20,6 +20,10 @@ const (
 	dnsConnectionMaxIdle = 20 * time.Second
 	dnsReuseTimeout      = time.Second
 	customDNSConnections = 4
+	// 自定义 DNS 查询失败后进入冷却期，期间所有查询直接回退到 Fake-IP
+	// （域名交给 SSH 服务器解析）；冷却结束后自动重试，避免一次瞬态失败
+	// 让整个会话永久降级，也不会让每个查询都白等超时。
+	customDNSRetryInterval = 5 * time.Minute
 )
 
 type customDNSResolver struct {
@@ -28,9 +32,10 @@ type customDNSResolver struct {
 	fake     *fakeDNSResolver
 	cache    *dnsNameCache
 	logger   *slog.Logger
-	// unavailable 表示自定义 DNS 曾经查询失败，之后所有查询直接回退到
-	// Fake-IP（域名交给 SSH 服务器解析），避免每个查询都白等超时。
-	unavailable atomic.Bool
+	// unavailableSince 记录最近一次查询失败的纳秒时间戳，0 表示当前可用。
+	// 查询失败后进入 customDNSRetryInterval 冷却期，期间所有查询直接回退
+	// 到 Fake-IP；冷却结束后恢复尝试，成功即清除时间戳。
+	unavailableSince atomic.Int64
 }
 
 func newCustomDNSResolver(dialer Dialer, address string, fake *fakeDNSResolver, cache *dnsNameCache, logger *slog.Logger) *customDNSResolver {
@@ -49,11 +54,21 @@ func newCustomDNSResolver(dialer Dialer, address string, fake *fakeDNSResolver, 
 	return resolver
 }
 
+// inCooldown 报告自定义 DNS 是否仍处于失败冷却期。
+func (r *customDNSResolver) inCooldown() bool {
+	since := r.unavailableSince.Load()
+	if since == 0 {
+		return false
+	}
+	return time.Since(time.Unix(0, since)) < customDNSRetryInterval
+}
+
 // resolve 使用用户指定的 DNS 获得真实 IPv4，但只向 Windows 返回 Fake-IP。
 // AAAA 和其他扩展记录返回空回答，避免远端没有 IPv6 时浏览器被真实 AAAA 卡住。
-// 自定义 DNS 不可达时自动回退到 Fake-IP（域名交给 SSH 服务器解析），不阻塞页面。
+// 自定义 DNS 不可达时进入冷却期回退到 Fake-IP（域名交给 SSH 服务器解析），
+// 冷却结束后自动重试，不阻塞页面。
 func (r *customDNSResolver) resolve(ctx context.Context, payload []byte) ([]byte, error) {
-	if r.unavailable.Load() {
+	if r.inCooldown() {
 		return r.fake.resolve(payload)
 	}
 	var query dnsmessage.Message
@@ -72,11 +87,15 @@ func (r *customDNSResolver) resolve(ctx context.Context, payload []byte) ([]byte
 	upstreamPayload, err := forward.resolve(ctx, payload)
 	if err != nil {
 		// 经 SSH 查询自定义 DNS 失败（服务器到该 DNS 不可达），降级为
-		// 域名交给 SSH 服务器解析，保证页面仍然可用。
-		r.unavailable.Store(true)
-		r.logger.Warn("自定义 DNS 经 SSH 查询失败，已回退到 SSH 服务器解析域名", "错误", err)
+		// 域名交给 SSH 服务器解析，保证页面仍然可用；保留最早的失败时间，
+		// 避免并发失败不断把冷却窗口往后推。
+		if r.unavailableSince.Load() == 0 {
+			r.unavailableSince.Store(time.Now().UnixNano())
+		}
+		r.logger.Warn("自定义 DNS 经 SSH 查询失败，冷却期内回退到 SSH 服务器解析域名", "错误", err)
 		return r.fake.resolve(payload)
 	}
+	r.unavailableSince.Store(0)
 	var upstream dnsmessage.Message
 	if err := upstream.Unpack(upstreamPayload); err != nil {
 		return nil, fmt.Errorf("解析自定义 DNS 响应失败：%w", err)

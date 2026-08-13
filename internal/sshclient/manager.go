@@ -200,6 +200,10 @@ func (m *Manager) ensureConnected(ctx context.Context) (*ssh.Client, error) {
 	}
 	m.client = client
 	m.raw = raw
+	// 计数必须在持锁状态下增加：Close 拿到锁后才会执行 wg.Wait，
+	// 锁内 Add 保证所有保活协程都被 Wait 覆盖，不违反 WaitGroup 的
+	// “计数器归零后不得再 Add”约定。
+	m.wg.Add(1)
 	// 第一次连接后固定实际服务器 IP。全局路由启用后即使 SSH 断线，
 	// 重连也不依赖可能需要当前 SSH 通道才能工作的系统 DNS。
 	if tcpAddress, ok := raw.RemoteAddr().(*net.TCPAddr); ok {
@@ -209,7 +213,6 @@ func (m *Manager) ensureConnected(ctx context.Context) (*ssh.Client, error) {
 	m.mu.Unlock()
 
 	m.logger.Info("SSH 连接已建立", "地址", address)
-	m.wg.Add(1)
 	go m.keepalive(client)
 	return client, nil
 }

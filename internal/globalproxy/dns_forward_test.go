@@ -233,7 +233,76 @@ func TestCustomDNSFallsBackToFakeIPOnUpstreamFailure(t *testing.T) {
 	if !isFakeAddress(address) {
 		t.Fatalf("回退应答不是 Fake-IP：%s", address)
 	}
-	if !resolver.unavailable.Load() {
-		t.Fatal("自定义 DNS 失败后未标记为不可用")
+	if !resolver.inCooldown() {
+		t.Fatal("自定义 DNS 失败后未进入冷却期")
+	}
+}
+
+// TestCustomDNSRetriesAfterCooldown 验证冷却期内不触碰自定义 DNS，
+// 冷却结束后自动重试并在成功后恢复可用，而不是整个会话永久降级。
+func TestCustomDNSRetriesAfterCooldown(t *testing.T) {
+	name, err := dnsmessage.NewName("example.com.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	queryMessage := dnsmessage.Message{
+		Header:    dnsmessage.Header{ID: 7, RecursionDesired: true},
+		Questions: []dnsmessage.Question{{Name: name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}},
+	}
+	query, err := queryMessage.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseMessage := dnsmessage.Message{
+		Header:    dnsmessage.Header{ID: 7, Response: true, RecursionAvailable: true},
+		Questions: queryMessage.Questions,
+		Answers: []dnsmessage.Resource{{
+			Header: dnsmessage.ResourceHeader{Name: name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: 60},
+			Body:   &dnsmessage.AResource{A: [4]byte{203, 0, 113, 9}},
+		}},
+	}
+	response, err := responseMessage.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dialCount atomic.Int32
+	dialer := dialerFunc(func(context.Context, string, string) (net.Conn, error) {
+		dialCount.Add(1)
+		client, server := net.Pipe()
+		go serveDelayedDNSResponse(server, response, new(atomic.Int32), new(atomic.Int32))
+		return client, nil
+	})
+	cache := newDNSNameCache()
+	resolver := newCustomDNSResolver(dialer, "9.9.9.9:53", newFakeDNSResolver(cache), cache, slog.Default())
+	defer resolver.close()
+
+	// 冷却期内：直接回退 Fake-IP，不应发起任何自定义 DNS 连接。
+	resolver.unavailableSince.Store(time.Now().Add(-time.Minute).UnixNano())
+	fallback, err := resolver.resolve(context.Background(), query)
+	if err != nil {
+		t.Fatalf("冷却期内应回退到 Fake-IP 而不是报错：%v", err)
+	}
+	var fallbackMessage dnsmessage.Message
+	if err := fallbackMessage.Unpack(fallback); err != nil {
+		t.Fatal(err)
+	}
+	fallbackBody, ok := fallbackMessage.Answers[0].Body.(*dnsmessage.AResource)
+	if !ok || !isFakeAddress(netip.AddrFrom4(fallbackBody.A)) {
+		t.Fatalf("冷却期内的回退应答不是 Fake-IP：%v", fallbackMessage.Answers)
+	}
+	if dialCount.Load() != 0 {
+		t.Fatalf("冷却期内不应连接自定义 DNS，实际建立 %d 次", dialCount.Load())
+	}
+
+	// 冷却期结束后：重新尝试自定义 DNS，成功后清除冷却状态。
+	resolver.unavailableSince.Store(time.Now().Add(-customDNSRetryInterval).UnixNano())
+	if _, err := resolver.resolve(context.Background(), query); err != nil {
+		t.Fatalf("冷却期结束后应重试自定义 DNS 而不是报错：%v", err)
+	}
+	if dialCount.Load() != 1 {
+		t.Fatalf("冷却期结束后应重试自定义 DNS，实际建立 %d 次连接", dialCount.Load())
+	}
+	if resolver.inCooldown() {
+		t.Fatal("自定义 DNS 重试成功后未清除冷却状态")
 	}
 }
