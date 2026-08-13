@@ -85,6 +85,11 @@ func (r *customDNSResolver) resolve(ctx context.Context, payload []byte) ([]byte
 
 	forward := r.forwards[(r.next.Add(1)-1)%uint32(len(r.forwards))]
 	upstreamPayload, err := forward.resolve(ctx, payload)
+	if err != nil && ctx.Err() == nil {
+		// 首条通道失败后再换一条独立通道重试一次，排除单条 SSH 通道的瞬时问题。
+		forward = r.forwards[(r.next.Add(1))%uint32(len(r.forwards))]
+		upstreamPayload, err = forward.resolve(ctx, payload)
+	}
 	if err != nil {
 		// 经 SSH 查询自定义 DNS 失败（服务器到该 DNS 不可达），降级为
 		// 域名交给 SSH 服务器解析，保证页面仍然可用；保留最早的失败时间，

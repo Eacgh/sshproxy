@@ -192,6 +192,66 @@ func serveDelayedDNSResponse(connection net.Conn, response []byte, active, maxim
 	_, _ = connection.Write(append(header, response...))
 }
 
+// TestCustomDNSRetriesOnSecondChannel 验证首条通道失败后会自动换第二条
+// 通道重试，单条通道的瞬时故障不会直接回退到 Fake-IP。
+func TestCustomDNSRetriesOnSecondChannel(t *testing.T) {
+	name, err := dnsmessage.NewName("example.com.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	queryMessage := dnsmessage.Message{
+		Header:    dnsmessage.Header{ID: 11, RecursionDesired: true},
+		Questions: []dnsmessage.Question{{Name: name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}},
+	}
+	query, err := queryMessage.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseMessage := dnsmessage.Message{
+		Header:    dnsmessage.Header{ID: 11, Response: true, RecursionAvailable: true},
+		Questions: queryMessage.Questions,
+		Answers: []dnsmessage.Resource{{
+			Header: dnsmessage.ResourceHeader{Name: name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: 60},
+			Body:   &dnsmessage.AResource{A: [4]byte{203, 0, 113, 10}},
+		}},
+	}
+	response, err := responseMessage.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dialCount atomic.Int32
+	dialer := dialerFunc(func(context.Context, string, string) (net.Conn, error) {
+		if dialCount.Add(1) == 1 {
+			return nil, errors.New("首条通道连接失败")
+		}
+		client, server := net.Pipe()
+		go serveDelayedDNSResponse(server, response, new(atomic.Int32), new(atomic.Int32))
+		return client, nil
+	})
+	cache := newDNSNameCache()
+	resolver := newCustomDNSResolver(dialer, "9.9.9.9:53", newFakeDNSResolver(cache), cache, slog.Default())
+	defer resolver.close()
+
+	packed, err := resolver.resolve(context.Background(), query)
+	if err != nil {
+		t.Fatalf("首条通道失败后应换通道重试成功，实际返回错误：%v", err)
+	}
+	var unpacked dnsmessage.Message
+	if err := unpacked.Unpack(packed); err != nil {
+		t.Fatal(err)
+	}
+	body, ok := unpacked.Answers[0].Body.(*dnsmessage.AResource)
+	if !ok || !isFakeAddress(netip.AddrFrom4(body.A)) {
+		t.Fatalf("重试成功的应答不是 Fake-IP：%v", unpacked.Answers)
+	}
+	if dialCount.Load() != 2 {
+		t.Fatalf("应建立 2 次连接（首条失败 + 重试成功），实际 %d", dialCount.Load())
+	}
+	if resolver.inCooldown() {
+		t.Fatal("重试成功后不应进入冷却期")
+	}
+}
+
 // TestCustomDNSFallsBackToFakeIPOnUpstreamFailure 验证自定义 DNS 不可达时
 // 自动回退到 Fake-IP 解析，页面不会被卡死。
 func TestCustomDNSFallsBackToFakeIPOnUpstreamFailure(t *testing.T) {

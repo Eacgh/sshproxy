@@ -14,7 +14,9 @@ import (
 	M "github.com/xjasonlyu/tun2socks/v2/metadata"
 )
 
-const dnsQueryTimeout = 5 * time.Second
+// 自定义 DNS 查询需要覆盖 SSH 通道建立、服务器端连接和 DNS-over-TCP 往返
+// 的完整链路，比本机 Fake-IP 回答留出更多余量，避免慢链路被误判为失败。
+const dnsQueryTimeout = 8 * time.Second
 
 // sshTransport 让 tun2socks 直接复用 SSH Manager，避免本机 SOCKS 流量再次进入虚拟网卡。
 // 普通 UDP 会被拒绝；DNS 在本机用 Fake-IP 回答，真实域名只交给 SSH 服务器解析。
