@@ -3,7 +3,7 @@
 ; 产物：artifacts\SSHVPN-Setup-win-x64.exe
 
 #define MyAppName "SSH VPN"
-#define MyAppVersion "0.2.0"
+#define MyAppVersion "0.2.1"
 #define MyAppExeName "SshVpn.exe"
 #define MyAppPublisher "Eacgh"
 
