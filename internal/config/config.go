@@ -54,43 +54,25 @@ func Load(path string) (Config, error) {
 }
 
 // LoadProfile 从服务器列表 servers.json 中按名称加载一个服务器配置。
-// 列表由 GUI 维护，核心直接读取，不再需要单独的 config.json。
+// 列表由程序维护，核心直接读取，不再需要单独的 config.json。
 func LoadProfile(serversPath, name string) (Config, error) {
-	data, err := os.ReadFile(serversPath)
-	if err != nil {
+	if _, err := os.Stat(serversPath); err != nil {
 		if os.IsNotExist(err) {
 			return Config{}, fmt.Errorf("找不到服务器列表 %q", serversPath)
 		}
 		return Config{}, fmt.Errorf("读取服务器列表失败：%w", err)
 	}
-	var servers []serverEntry
-	if err := json.Unmarshal(data, &servers); err != nil {
-		return Config{}, fmt.Errorf("解析服务器列表失败：%w", err)
+	servers, err := LoadServers(serversPath)
+	if err != nil {
+		return Config{}, err
 	}
 	for _, entry := range servers {
 		if entry.Name != name {
 			continue
 		}
-		cfg := Config{
-			ServerAddress: entry.ServerAddress,
-			Username:      entry.Username,
-			Password:      entry.Password,
-			ProxyPort:     entry.ProxyPort,
-			DNSServer:     entry.DNSServer,
-		}
-		return cfg.validateComplete()
+		return entry.ToConfig()
 	}
 	return Config{}, fmt.Errorf("服务器列表中没有名为 %q 的服务器", name)
-}
-
-// serverEntry 是 servers.json 中的一条服务器记录，与 GUI 的 ServerProfile 对应。
-type serverEntry struct {
-	Name          string `json:"name"`
-	ServerAddress string `json:"server_address"`
-	Username      string `json:"username"`
-	Password      string `json:"password"`
-	ProxyPort     int    `json:"proxy_port"`
-	DNSServer     string `json:"dns_server,omitempty"`
 }
 
 // validateComplete 补全默认端口并执行完整校验。

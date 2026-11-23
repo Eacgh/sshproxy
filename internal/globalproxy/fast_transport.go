@@ -7,6 +7,9 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,6 +18,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 
+	"sshvpn/internal/config"
 	"sshvpn/internal/stats"
 )
 
@@ -36,17 +40,72 @@ type dialLogState struct {
 	suppressed int
 }
 
+type directTransport interface {
+	DialTCP(ctx context.Context, address string) (net.Conn, error)
+	ListenUDP(ipv6 bool) (net.PacketConn, error)
+	ResolveIPv4(ctx context.Context, host string) (netip.Addr, error)
+}
+
+type fastTransportConfig struct {
+	dialer       Dialer
+	dnsServer    string
+	logger       *slog.Logger
+	traffic      *stats.Traffic
+	mode         config.ProxyMode
+	processRules []config.ProcessRule
+	lookup       processLookup
+	direct       directTransport
+}
+
+type flowAbortTarget struct {
+	cancel context.CancelFunc
+	origin io.Closer
+	remote io.Closer
+}
+
+func closeFlowTargets(targets []flowAbortTarget) {
+	for _, target := range targets {
+		if target.cancel != nil {
+			target.cancel()
+		}
+		if target.origin != nil {
+			_ = target.origin.Close()
+		}
+		if target.remote != nil {
+			_ = target.remote.Close()
+		}
+	}
+}
+
+type trackedFlow struct {
+	origin     io.Closer
+	remote     io.Closer
+	ctx        context.Context
+	cancel     context.CancelFunc
+	classified bool
+	pid        uint32
+	paths      []string
+	proxied    bool
+	aborted    bool
+}
+
 // fastTransportHandler 是面向 SSH 通道优化的 tun2socks 传输处理器。
-// 相比通用处理器，它移除了逐次读写的统计原子操作，并使用更大的复制缓冲区减少 SSH 包装调用。
+// 相比通用处理器，它移除了逐次读写的统计原子操作，并使用更大的复制缓冲区减少 SSH 包装调用；
+// 在按进程分流模式下支持依据源端口反查进程并将非目标流量直连物理网卡。
 type fastTransportHandler struct {
 	transport *sshTransport
 	logger    *slog.Logger
 	stats     *stats.Traffic
+	mode      config.ProxyMode
+	matcher   *ProcessMatcher
+	lookup    processLookup
+	direct    directTransport
+	selfPID   uint32
 
-	mu          sync.Mutex
-	connections map[net.Conn]struct{}
-	closed      bool
-	wg          sync.WaitGroup
+	mu     sync.Mutex
+	flows  map[*trackedFlow]struct{}
+	closed bool
+	wg     sync.WaitGroup
 
 	logMu    sync.Mutex
 	dialLogs map[string]dialLogState
@@ -57,85 +116,297 @@ func newFastTransportHandler(dialer Dialer, dnsServer string, logger *slog.Logge
 }
 
 func newFastTransportHandlerWithStats(dialer Dialer, dnsServer string, logger *slog.Logger, traffic *stats.Traffic) *fastTransportHandler {
+	return newFastTransportHandlerWithConfig(fastTransportConfig{
+		dialer:    dialer,
+		dnsServer: dnsServer,
+		logger:    logger,
+		traffic:   traffic,
+		mode:      config.ModeGlobal,
+	})
+}
+
+func newFastTransportHandlerWithConfig(cfg fastTransportConfig) *fastTransportHandler {
+	logger := cfg.logger
 	if logger == nil {
 		logger = slog.Default()
 	}
+	traffic := cfg.traffic
 	if traffic == nil {
 		traffic = new(stats.Traffic)
 	}
+	mode := cfg.mode
+	if mode == "" {
+		mode = config.ModeGlobal
+	}
 	return &fastTransportHandler{
-		transport:   newSSHTransport(dialer, dnsServer, logger),
-		logger:      logger,
-		stats:       traffic,
-		connections: make(map[net.Conn]struct{}),
-		dialLogs:    make(map[string]dialLogState),
+		transport: newSSHTransport(cfg.dialer, cfg.dnsServer, logger),
+		logger:    logger,
+		stats:     traffic,
+		mode:      mode,
+		matcher:   NewProcessMatcher(cfg.processRules),
+		lookup:    cfg.lookup,
+		direct:    cfg.direct,
+		selfPID:   uint32(os.Getpid()),
+		flows:     make(map[*trackedFlow]struct{}),
+		dialLogs:  make(map[string]dialLogState),
 	}
 }
 
+// SetProcessRules 原子替换按进程分流规则，并立即取消或断开路由方向发生变化的活动连接，
+// 使动态新增、禁用或移除白名单进程无需等待长连接自然关闭即可实时切换。
+func (h *fastTransportHandler) SetProcessRules(rules []config.ProcessRule) int {
+	var toAbort []flowAbortTarget
+
+	h.mu.Lock()
+	if h.matcher != nil {
+		h.matcher.SetRules(rules)
+	}
+	if h.mode == config.ModeProcess && !h.closed {
+		for flow := range h.flows {
+			if !flow.classified || flow.aborted {
+				continue
+			}
+			nowProxied := false
+			if flow.pid != 0 && flow.pid != h.selfPID && h.matcher != nil {
+				_, nowProxied = h.matcher.MatchAny(flow.paths)
+			}
+			if nowProxied != flow.proxied {
+				flow.aborted = true
+				toAbort = append(toAbort, flowAbortTarget{
+					cancel: flow.cancel,
+					origin: flow.origin,
+					remote: flow.remote,
+				})
+			}
+		}
+	}
+	h.mu.Unlock()
+
+	closeFlowTargets(toAbort)
+	return len(toAbort)
+}
+
 func (h *fastTransportHandler) HandleTCP(origin adapter.TCPConn) {
-	if !h.begin(origin) {
+	flow, ok := h.beginFlow(origin)
+	if !ok {
 		origin.Close()
 		return
 	}
 	go func() {
-		defer h.finish(origin)
-		h.handleTCP(origin)
+		defer h.finishFlow(flow)
+		h.handleTCPFlow(flow, origin)
 	}()
 }
 
 func (h *fastTransportHandler) handleTCP(origin adapter.TCPConn) {
+	flow, ok := h.beginFlow(origin)
+	if !ok {
+		origin.Close()
+		return
+	}
+	defer h.finishFlow(flow)
+	h.handleTCPFlow(flow, origin)
+}
+
+func (h *fastTransportHandler) handleTCPFlow(flow *trackedFlow, origin adapter.TCPConn) {
 	defer origin.Close()
 	metadata, err := metadataFromEndpoint(origin.ID(), M.TCP)
 	if err != nil {
 		h.logger.Debug("解析全局 TCP 目标失败", "错误", err)
 		return
 	}
-	var initial []byte
-	var serverName string
-	if metadata.DstPort == 443 {
-		if mappedName, ok := h.transport.mappedServerName(metadata); ok {
-			serverName = mappedName
-		} else {
-			initial, serverName, err = sniffTLSServerName(origin)
-			if err != nil && len(initial) == 0 && !isTimeoutFailure(err) {
-				return
-			}
-			// 嗅探彻底失败且没有拿到域名时，目标 DstIP 是浏览器缓存的过期
-			// Fake-IP，不能把它当真实地址去连（必失败并触发熔断）；直接关闭
-			// 让浏览器重新解析 DNS 拿到新的映射。
-			if len(initial) == 0 && serverName == "" {
-				return
+	if metadata.DstPort != 53 && h.mode == config.ModeProcess {
+		id, ok := h.lookupTCPProcess(metadata)
+		useProxy, matchedBy, aborted := h.classifyFlow(flow, id, ok)
+		if aborted {
+			return
+		}
+		if !useProxy {
+			h.handleDirectTCP(flow, origin, metadata, id.Path)
+			return
+		}
+		h.handleProxyTCP(flow, origin, metadata, id.Path, matchedBy)
+		return
+	}
+	h.handleProxyTCP(flow, origin, metadata, "", "")
+}
+
+func (h *fastTransportHandler) lookupTCPProcess(metadata *M.Metadata) (ProcessIdentity, bool) {
+	if h.lookup == nil {
+		return ProcessIdentity{}, false
+	}
+	return h.lookup.LookupTCP(metadata.SrcIP, metadata.SrcPort, metadata.DstIP, metadata.DstPort)
+}
+
+func (h *fastTransportHandler) lookupUDPProcess(metadata *M.Metadata) (ProcessIdentity, bool) {
+	if h.lookup == nil {
+		return ProcessIdentity{}, false
+	}
+	return h.lookup.LookupUDP(metadata.SrcIP, metadata.SrcPort)
+}
+
+func (h *fastTransportHandler) classifyFlow(flow *trackedFlow, id ProcessIdentity, ok bool) (bool, string, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed || flow.aborted {
+		return false, "", true
+	}
+	flow.classified = true
+	if ok && id.PID != 0 {
+		flow.pid = id.PID
+		flow.paths = append([]string(nil), id.Paths...)
+		if id.PID != h.selfPID && h.matcher != nil {
+			if matched, hit := h.matcher.MatchAny(id.Paths); hit {
+				flow.proxied = true
+				return true, matched, false
 			}
 		}
 	}
+	return false, "", false
+}
+
+func (h *fastTransportHandler) handleProxyTCP(flow *trackedFlow, origin adapter.TCPConn, metadata *M.Metadata, processPath, matchedBy string) {
+	if flow.ctx.Err() != nil {
+		return
+	}
+	isFake := isFakeAddress(metadata.DstIP)
+	var initial []byte
+	var serverName string
+	if mappedName, ok := h.transport.mappedServerName(metadata); ok {
+		serverName = mappedName
+	} else if metadata.DstPort == 443 {
+		var err error
+		initial, serverName, err = sniffTLSServerName(origin)
+		if err != nil && len(initial) == 0 && !isTimeoutFailure(err) {
+			return
+		}
+		if flow.ctx.Err() != nil {
+			return
+		}
+		if isFake && serverName == "" {
+			// 目标 DstIP 是缓存的过期 Fake-IP 且未提取到 SNI，直接关闭让上层
+			// 重新解析 DNS 拿到新映射，避免把它当真实地址拨号触发熔断。
+			h.logger.Debug("忽略未命中映射的过期 Fake-IP 连接", "目标", metadata.DestinationAddress())
+			return
+		}
+	} else if isFake {
+		h.logger.Debug("忽略未命中映射的过期 Fake-IP 连接", "目标", metadata.DestinationAddress())
+		return
+	}
+	if flow.ctx.Err() != nil {
+		return
+	}
 	forwardTarget := h.transport.targetAddress(metadata, serverName)
-	ctx, cancel := context.WithTimeout(context.Background(), tcpDialTimeout)
+	ctx, cancel := context.WithTimeout(flow.ctx, tcpDialTimeout)
 	dialStarted := time.Now()
 	remote, err := h.transport.DialContextWithServerName(ctx, metadata, serverName)
 	dialDuration := time.Since(dialStarted)
 	cancel()
 	if err != nil {
-		h.logDialFailure(forwardTarget, err)
+		if flow.ctx.Err() == nil {
+			h.logDialFailure(forwardTarget, err)
+		}
 		return
 	}
+	h.clearDialLog(forwardTarget)
 	if dialDuration >= time.Second {
 		h.logger.Debug("全局 TCP 通道建立较慢", "目标", forwardTarget, "等待及SSH建连耗时", dialDuration.Round(10*time.Millisecond))
 	}
-	if !h.track(remote) {
+	if !h.attachRemote(flow, remote) {
 		remote.Close()
 		return
 	}
 	defer func() {
-		h.untrack(remote)
+		h.detachRemote(flow, remote)
 		remote.Close()
 	}()
 	if err := writeAll(remote, initial); err != nil {
-		h.logDialFailure(forwardTarget, err)
+		if flow.ctx.Err() == nil {
+			h.logDialFailure(forwardTarget, err)
+		}
 		return
 	}
-	h.logger.Debug("全局 TCP 通道已建立", "目标", forwardTarget)
+	if len(initial) > 0 {
+		h.stats.Add(uint64(len(initial)), 0)
+	}
+	if processPath != "" {
+		if matchedBy != "" && !strings.EqualFold(matchedBy, processPath) {
+			h.logger.Debug("进程代理 TCP 通道已建立", "目标", forwardTarget, "进程", processPath, "命中祖先", matchedBy)
+		} else {
+			h.logger.Debug("进程代理 TCP 通道已建立", "目标", forwardTarget, "进程", processPath)
+		}
+	} else {
+		h.logger.Debug("全局 TCP 通道已建立", "目标", forwardTarget)
+	}
 
-	h.relayTCP(origin, remote)
+	h.relayTCP(origin, remote, h.stats)
+}
+
+func (h *fastTransportHandler) handleDirectTCP(flow *trackedFlow, origin adapter.TCPConn, metadata *M.Metadata, processPath string) {
+	if h.direct == nil || flow.ctx.Err() != nil {
+		return
+	}
+	isFake := isFakeAddress(metadata.DstIP)
+	var initial []byte
+	var domain string
+	if mappedName, ok := h.transport.mappedServerName(metadata); ok {
+		domain = mappedName
+	} else if metadata.DstPort == 443 {
+		var err error
+		initial, domain, err = sniffTLSServerName(origin)
+		if err != nil && len(initial) == 0 && !isTimeoutFailure(err) {
+			return
+		}
+		if flow.ctx.Err() != nil {
+			return
+		}
+		if isFake && domain == "" {
+			h.logger.Debug("直连旁路忽略未命中映射的过期 Fake-IP", "目标", metadata.DestinationAddress())
+			return
+		}
+	} else if isFake {
+		h.logger.Debug("直连旁路忽略未命中映射的过期 Fake-IP", "目标", metadata.DestinationAddress())
+		return
+	}
+	if flow.ctx.Err() != nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(flow.ctx, tcpDialTimeout)
+	defer cancel()
+
+	dialTarget := metadata.DestinationAddress()
+	if isFake {
+		resolvedIP, err := h.direct.ResolveIPv4(ctx, domain)
+		if err != nil {
+			if flow.ctx.Err() == nil {
+				h.logger.Debug("直连进程解析域名失败", "进程", processPath, "域名", domain, "错误", err)
+			}
+			return
+		}
+		dialTarget = net.JoinHostPort(resolvedIP.String(), strconv.Itoa(int(metadata.DstPort)))
+	}
+
+	remote, err := h.direct.DialTCP(ctx, dialTarget)
+	if err != nil {
+		if flow.ctx.Err() == nil {
+			h.logger.Debug("直连 TCP 通道失败", "进程", processPath, "目标", dialTarget, "错误", err)
+		}
+		return
+	}
+	if !h.attachRemote(flow, remote) {
+		remote.Close()
+		return
+	}
+	defer func() {
+		h.detachRemote(flow, remote)
+		remote.Close()
+	}()
+	if err := writeAll(remote, initial); err != nil {
+		return
+	}
+	h.logger.Debug("直连 TCP 通道已建立", "进程", processPath, "目标", dialTarget)
+	h.relayTCP(origin, remote, nil)
 }
 
 func writeAll(connection net.Conn, payload []byte) error {
@@ -174,6 +445,14 @@ func (h *fastTransportHandler) logDialFailure(target string, err error) {
 	h.logger.Debug("建立全局 TCP 通道失败", "目标", target, "错误", errorMessage)
 }
 
+// clearDialLog 在目标恢复成功后清理其失败日志状态，避免日志表随失败
+// 目标数量无限增长。
+func (h *fastTransportHandler) clearDialLog(target string) {
+	h.logMu.Lock()
+	delete(h.dialLogs, target)
+	h.logMu.Unlock()
+}
+
 func localizedDialError(err error) string {
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
@@ -189,24 +468,19 @@ func localizedDialError(err error) string {
 	}
 }
 
-func (h *fastTransportHandler) relayTCP(origin, remote net.Conn) {
+func (h *fastTransportHandler) relayTCP(origin, remote net.Conn, traffic *stats.Traffic) {
 	done := make(chan struct{}, 2)
-	go h.copyTCP(remote, origin, done, true)  // 本机 -> 远端：上行
-	go h.copyTCP(origin, remote, done, false) // 远端 -> 本机：下行
+	go h.copyTCP(remote, origin, done, true, traffic)  // 本机 -> 远端：上行
+	go h.copyTCP(origin, remote, done, false, traffic) // 远端 -> 本机：下行
 	<-done
 	<-done
 }
 
-func (h *fastTransportHandler) copyTCP(destination, source net.Conn, done chan<- struct{}, upload bool) {
+func (h *fastTransportHandler) copyTCP(destination, source net.Conn, done chan<- struct{}, upload bool, traffic *stats.Traffic) {
 	defer func() { done <- struct{}{} }()
 	buffer := tcpBufferPool.Get().([]byte)
-	bytes, _ := io.CopyBuffer(destination, source, buffer)
+	_, _ = traffic.CopyBuffer(destination, source, buffer, upload)
 	tcpBufferPool.Put(buffer)
-	if upload {
-		h.stats.Add(uint64(bytes), 0)
-	} else {
-		h.stats.Add(0, uint64(bytes))
-	}
 	if closeReader, ok := source.(interface{ CloseRead() error }); ok {
 		_ = closeReader.CloseRead()
 	}
@@ -217,29 +491,112 @@ func (h *fastTransportHandler) copyTCP(destination, source net.Conn, done chan<-
 }
 
 func (h *fastTransportHandler) HandleUDP(origin adapter.UDPConn) {
-	if !h.begin(origin) {
+	flow, ok := h.beginFlow(origin)
+	if !ok {
 		origin.Close()
 		return
 	}
 	go func() {
-		defer h.finish(origin)
-		h.handleUDP(origin)
+		defer h.finishFlow(flow)
+		h.handleUDPFlow(flow, origin)
 	}()
 }
 
 func (h *fastTransportHandler) handleUDP(origin adapter.UDPConn) {
+	flow, ok := h.beginFlow(origin)
+	if !ok {
+		origin.Close()
+		return
+	}
+	defer h.finishFlow(flow)
+	h.handleUDPFlow(flow, origin)
+}
+
+func (h *fastTransportHandler) handleUDPFlow(flow *trackedFlow, origin adapter.UDPConn) {
 	defer origin.Close()
 	metadata, err := metadataFromEndpoint(origin.ID(), M.UDP)
 	if err != nil {
+		return
+	}
+	if metadata.DstPort != 53 && h.mode == config.ModeProcess {
+		id, ok := h.lookupUDPProcess(metadata)
+		useProxy, _, aborted := h.classifyFlow(flow, id, ok)
+		if aborted {
+			return
+		}
+		if useProxy {
+			h.logger.Debug("已阻止白名单进程的非 DNS UDP 流量，促使回退到 TCP", "进程", id.Path, "目标", metadata.DestinationAddress())
+			return
+		}
+		h.handleDirectUDP(flow, origin, metadata)
+		return
+	}
+	if flow.ctx.Err() != nil {
 		return
 	}
 	remote, err := h.transport.DialUDP(metadata)
 	if err != nil {
 		return
 	}
-	defer remote.Close()
-	target := metadata.UDPAddr()
+	if !h.attachRemote(flow, remote) {
+		remote.Close()
+		return
+	}
+	defer func() {
+		h.detachRemote(flow, remote)
+		remote.Close()
+	}()
+	relayUDP(origin, remote, metadata.UDPAddr())
+}
 
+func (h *fastTransportHandler) handleDirectUDP(flow *trackedFlow, origin adapter.UDPConn, metadata *M.Metadata) {
+	if h.direct == nil || flow.ctx.Err() != nil {
+		return
+	}
+	isFake := isFakeAddress(metadata.DstIP)
+	useIPv6 := metadata.DstIP.Is6()
+	var targetAddr *net.UDPAddr
+	if isFake {
+		name, ok := h.transport.mappedServerName(metadata)
+		if !ok || name == "" {
+			return
+		}
+		ctx, cancel := context.WithTimeout(flow.ctx, directDNSTimeout)
+		resolvedIP, err := h.direct.ResolveIPv4(ctx, name)
+		cancel()
+		if err != nil {
+			if flow.ctx.Err() == nil {
+				h.logger.Debug("直连 UDP 解析域名失败", "域名", name, "错误", err)
+			}
+			return
+		}
+		targetAddr = net.UDPAddrFromAddrPort(netip.AddrPortFrom(resolvedIP, metadata.DstPort))
+		useIPv6 = false
+	} else {
+		targetAddr = metadata.UDPAddr()
+	}
+	if targetAddr == nil || flow.ctx.Err() != nil {
+		return
+	}
+
+	remote, err := h.direct.ListenUDP(useIPv6)
+	if err != nil {
+		h.logger.Debug("创建直连 UDP 套接字失败", "目标", targetAddr.String(), "错误", err)
+		return
+	}
+	if !h.attachRemote(flow, remote) {
+		remote.Close()
+		return
+	}
+	defer func() {
+		h.detachRemote(flow, remote)
+		remote.Close()
+	}()
+
+	relayUDP(origin, remote, targetAddr)
+}
+
+func relayUDP(origin, remote net.PacketConn, target net.Addr) {
 	done := make(chan struct{}, 2)
 	go copyUDP(remote, origin, target, done)
 	go copyUDP(origin, remote, nil, done)
@@ -295,35 +652,51 @@ func netipFromTCPIPAddress(address tcpip.Address) (netip.Addr, bool) {
 	return value.Unmap(), true
 }
 
-func (h *fastTransportHandler) begin(connection net.Conn) bool {
+func (h *fastTransportHandler) beginFlow(origin io.Closer) (*trackedFlow, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed {
-		return false
+		return nil, false
 	}
-	h.connections[connection] = struct{}{}
+	ctx, cancel := context.WithCancel(context.Background())
+	flow := &trackedFlow{
+		origin: origin,
+		ctx:    ctx,
+		cancel: cancel,
+	}
+	h.flows[flow] = struct{}{}
 	h.wg.Add(1)
-	return true
+	return flow, true
 }
 
-func (h *fastTransportHandler) finish(connection net.Conn) {
-	h.untrack(connection)
+func (h *fastTransportHandler) finishFlow(flow *trackedFlow) {
+	if flow == nil {
+		return
+	}
+	if flow.cancel != nil {
+		flow.cancel()
+	}
+	h.mu.Lock()
+	delete(h.flows, flow)
+	h.mu.Unlock()
 	h.wg.Done()
 }
 
-func (h *fastTransportHandler) track(connection net.Conn) bool {
+func (h *fastTransportHandler) attachRemote(flow *trackedFlow, remote io.Closer) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.closed {
+	if h.closed || flow.aborted {
 		return false
 	}
-	h.connections[connection] = struct{}{}
+	flow.remote = remote
 	return true
 }
 
-func (h *fastTransportHandler) untrack(connection net.Conn) {
+func (h *fastTransportHandler) detachRemote(flow *trackedFlow, remote io.Closer) {
 	h.mu.Lock()
-	delete(h.connections, connection)
+	if flow.remote == remote {
+		flow.remote = nil
+	}
 	h.mu.Unlock()
 }
 
@@ -334,14 +707,18 @@ func (h *fastTransportHandler) Close() {
 		return
 	}
 	h.closed = true
-	connections := make([]net.Conn, 0, len(h.connections))
-	for connection := range h.connections {
-		connections = append(connections, connection)
+	toAbort := make([]flowAbortTarget, 0, len(h.flows))
+	for flow := range h.flows {
+		flow.aborted = true
+		toAbort = append(toAbort, flowAbortTarget{
+			cancel: flow.cancel,
+			origin: flow.origin,
+			remote: flow.remote,
+		})
 	}
 	h.mu.Unlock()
-	for _, connection := range connections {
-		connection.Close()
-	}
+
+	closeFlowTargets(toAbort)
 	h.wg.Wait()
 	h.transport.Close()
 }

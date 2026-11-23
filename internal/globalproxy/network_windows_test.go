@@ -63,6 +63,8 @@ func TestConfigureNetworkAddsAndRemovesManagedRoutes(t *testing.T) {
 	assertCommandContains(t, commands, "delete route prefix=192.168.1.1/32")
 	assertCommandContains(t, commands, "delete dnsservers name=SSH VPN address=all")
 	assertCommandContains(t, commands, "delete address interface=SSH VPN address=fd00::1")
+	// 关闭时必须删除 Wintun 虚拟网卡本身，避免在“网络连接”中残留。
+	assertCommandContains(t, commands, "delete interface name=SSH VPN")
 }
 
 func TestConfiguredDNSServersReadsWindowsAdapters(t *testing.T) {

@@ -20,6 +20,8 @@ import (
 	"golang.org/x/sys/windows"
 	wgtun "golang.zx2c4.com/wireguard/tun"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
+
+	"sshvpn/internal/config"
 )
 
 const (
@@ -76,6 +78,15 @@ func (c *windowsController) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	ipv6InterfaceIndex := findDefaultIPv6InterfaceIndex()
+	physicalDNS, err := physicalIPv4DNSServers(route.InterfaceIndex)
+	if err != nil {
+		c.options.Logger.Warn("读取物理网卡 DNS 失败，将使用公共直连 DNS", "错误", err)
+	}
+	mode := c.options.Mode
+	if mode == "" {
+		mode = config.ModeGlobal
+	}
 
 	// Wintun 自带英文驱动安装日志；界面使用下面的中文生命周期日志代替。
 	log.SetOutput(io.Discard)
@@ -88,7 +99,17 @@ func (c *windowsController) Start(ctx context.Context) error {
 		return fmt.Errorf("创建 Wintun 虚拟网卡失败：%w", err)
 	}
 
-	transport := newFastTransportHandlerWithStats(c.options.Dialer, c.options.DNSServer, c.options.Logger, c.options.Traffic)
+	directDialer := newWindowsDirectDialer(route.InterfaceIndex, ipv6InterfaceIndex, physicalDNS, c.options.Logger)
+	transport := newFastTransportHandlerWithConfig(fastTransportConfig{
+		dialer:       c.options.Dialer,
+		dnsServer:    c.options.DNSServer,
+		logger:       c.options.Logger,
+		traffic:      c.options.Traffic,
+		mode:         mode,
+		processRules: c.options.ProcessRules,
+		lookup:       newWindowsProcessLookup(),
+		direct:       directDialer,
+	})
 	networkStack, err := core.CreateStack(&core.Config{
 		LinkEndpoint:     device,
 		TransportHandler: transport,
@@ -123,17 +144,60 @@ func (c *windowsController) Start(ctx context.Context) error {
 	if c.options.DNSServer != "" {
 		dnsMode = "经 SSH 查询 " + c.options.DNSServer + "，Fake-IP 使用 IPv4"
 	}
-	c.options.Logger.Info(
-		"全局 TCP 代理已启用",
-		"虚拟网卡", adapterName,
-		"MTU", tunnelMTU,
-		"TCP缓冲", "系统默认",
-		"中继缓冲", "128 KiB",
-		"域名解析", dnsMode,
-		"建连保护", "同目标限流和超时熔断",
-	)
-	c.options.Logger.Warn("当前版本会阻止普通 UDP；浏览器会回退到 TCP，游戏和语音软件可能不可用")
+	if mode == config.ModeProcess {
+		c.options.Logger.Info(
+			"按进程分流代理已启用（Wintun + gVisor）",
+			"虚拟网卡", adapterName,
+			"出站物理网卡", route.InterfaceName,
+			"已启用规则数", countEnabledRules(c.options.ProcessRules),
+			"域名解析", dnsMode,
+		)
+	} else {
+		c.options.Logger.Info(
+			"全局 TCP 代理已启用",
+			"虚拟网卡", adapterName,
+			"MTU", tunnelMTU,
+			"TCP缓冲", "系统默认",
+			"中继缓冲", "128 KiB",
+			"域名解析", dnsMode,
+			"建连保护", "同目标限流和超时熔断",
+		)
+		c.options.Logger.Warn("当前版本会阻止普通 UDP；浏览器会回退到 TCP，游戏和语音软件可能不可用")
+	}
 	return nil
+}
+
+func (c *windowsController) UpdateProcessRules(rules []config.ProcessRule) int {
+	c.mu.Lock()
+	transport := c.transport
+	mode := c.options.Mode
+	if mode == "" {
+		mode = config.ModeGlobal
+	}
+	c.options.ProcessRules = append([]config.ProcessRule(nil), rules...)
+	c.mu.Unlock()
+	if transport == nil {
+		return 0
+	}
+	closed := transport.SetProcessRules(rules)
+	if mode == config.ModeProcess {
+		c.options.Logger.Info(
+			"已热更新进程分流规则",
+			"已启用规则数", countEnabledRules(rules),
+			"已断开受影响连接", closed,
+		)
+	}
+	return closed
+}
+
+func countEnabledRules(rules []config.ProcessRule) int {
+	count := 0
+	for _, rule := range rules {
+		if rule.IsEnabled() && rule.MatchTarget() != "" {
+			count++
+		}
+	}
+	return count
 }
 
 func (c *windowsController) Close() error {
@@ -148,13 +212,15 @@ func (c *windowsController) Close() error {
 	}
 
 	var errs []error
+	// 先关闭设备（结束 Wintun 会话），再清理网络：删除虚拟网卡前必须
+	// 确保没有活动会话，否则 netsh 删除接口会失败并留下残余网卡。
+	if c.device != nil {
+		c.device.Close()
+	}
 	if c.network != nil {
 		if err := c.network.Close(); err != nil {
 			errs = append(errs, err)
 		}
-	}
-	if c.device != nil {
-		c.device.Close()
 	}
 	if c.transport != nil {
 		c.transport.Close()

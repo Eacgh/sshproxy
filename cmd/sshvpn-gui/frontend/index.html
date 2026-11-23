@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SSH VPN</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- 顶部栏 -->
+    <header class="topbar">
+      <div>
+        <h1 class="brand-title">SSH VPN</h1>
+        <p class="brand-sub">纯 Go 便携式 SSH 代理 · Wintun 按进程分流</p>
+      </div>
+      <div class="status-box">
+        <div class="status-line">
+          <span id="statusDot" class="status-dot dot-stopped"></span>
+          <span id="statusText" class="status-label">未连接</span>
+        </div>
+        <div id="endpointText" class="endpoint-text">SOCKS5 127.0.0.1:1080</div>
+      </div>
+    </header>
+
+    <!-- 页签导航 -->
+    <nav class="tabs" role="tablist">
+      <button class="tab-btn active" data-tab="connect" type="button">连接</button>
+      <button class="tab-btn" data-tab="process" type="button">进程分流 <span id="ruleBadge" class="badge">0</span></button>
+      <button class="tab-btn" data-tab="logs" type="button">日志</button>
+    </nav>
+
+    <!-- 主内容区 -->
+    <main class="tab-content">
+      <!-- 连接页 -->
+      <section id="tab-connect" class="tab-pane active">
+        <div class="connect-layout">
+          <aside class="server-panel card">
+            <div class="panel-header">
+              <h2>服务器列表</h2>
+              <button id="manageServersBtn" class="btn btn-secondary btn-sm" type="button">管理</button>
+            </div>
+            <ul id="serverList" class="server-list"></ul>
+            <div class="panel-hint">点击服务器查看或切换；右键托盘图标可快速连接/断开。</div>
+          </aside>
+
+          <section class="form-panel">
+            <h2 class="section-title">连接设置</h2>
+
+            <div class="field-group">
+              <label for="serverAddressInput">服务器地址</label>
+              <input id="serverAddressInput" type="text" placeholder="域名、IP 或 主机:端口" autocomplete="off" />
+            </div>
+
+            <div class="field-row">
+              <div class="field-group flex-1">
+                <label for="usernameInput">用户名</label>
+                <input id="usernameInput" type="text" autocomplete="off" />
+              </div>
+              <div class="field-group port-col">
+                <label for="proxyPortInput">代理端口</label>
+                <input id="proxyPortInput" type="text" maxlength="5" value="1080" autocomplete="off" />
+              </div>
+            </div>
+
+            <div class="field-group">
+              <div class="label-row">
+                <label for="passwordInput">密码</label>
+                <label class="inline-check">
+                  <input id="showPasswordCheck" type="checkbox" />
+                  <span>显示密码</span>
+                </label>
+              </div>
+              <input id="passwordInput" type="password" autocomplete="off" />
+            </div>
+
+            <div class="mode-card">
+              <div class="mode-card-header">
+                <span class="mode-card-title">代理模式</span>
+                <button id="gotoProcessBtn" class="btn-link" type="button">配置分流程序 →</button>
+              </div>
+              <div class="mode-options">
+                <label class="mode-option">
+                  <input type="radio" name="proxyMode" value="process" />
+                  <div>
+                    <div class="mode-name">按进程分流（Wintun）</div>
+                    <div class="mode-desc">仅白名单程序（含同名子进程，如 Edge）经 SSH 出口，其余软件如 Firefox 与局域网流量直连物理网卡。</div>
+                  </div>
+                </label>
+                <label class="mode-option">
+                  <input type="radio" name="proxyMode" value="global" />
+                  <div>
+                    <div class="mode-name">全局模式（Wintun TCP）</div>
+                    <div class="mode-desc">接管整机 IPv4/IPv6 TCP 流量并由 SSH 解析域名；非 DNS UDP 将被阻止。</div>
+                  </div>
+                </label>
+                <label class="mode-option">
+                  <input type="radio" name="proxyMode" value="socks5" />
+                  <div>
+                    <div class="mode-name">仅 SOCKS5 代理</div>
+                    <div class="mode-desc">仅在本机监听 127.0.0.1 代理端口，不创建虚拟网卡与系统路由。</div>
+                  </div>
+                </label>
+              </div>
+
+              <div class="field-group dns-field">
+                <label for="dnsServerInput">自定义上游 DNS（可选，仅 Wintun 模式）</label>
+                <input id="dnsServerInput" type="text" placeholder="留空则使用本地 Fake-IP 由 SSH 服务器解析" autocomplete="off" />
+                <div class="field-hint">填写 DNS IP 或 IP:端口后将通过 SSH 查询该 DNS；按进程分流下的直连程序仍使用物理网卡 DNS。</div>
+              </div>
+            </div>
+
+            <div id="validationBox" class="validation-error hidden"></div>
+
+            <div class="action-bar">
+              <div class="left-actions">
+                <button id="editBtn" class="btn btn-secondary" type="button">编辑</button>
+                <button id="saveBtn" class="btn btn-secondary" type="button">保存配置</button>
+              </div>
+              <button id="connectBtn" class="btn btn-primary" type="button">连接</button>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <!-- 进程分流页 -->
+      <section id="tab-process" class="tab-pane">
+        <div class="process-layout">
+          <div class="card process-intro">
+            <div class="process-intro-text">
+              <strong>Wintun + gVisor 按进程分流白名单</strong>
+              <p>仅勾选并启用的程序（<strong>自动覆盖其派生的全部子进程</strong>，如 Edge 网络服务、Antigravity 的 <code>language_server.exe</code>）或选定目录下的程序走 SSH 隧道；其余程序（如 <code>firefox.exe</code>、系统工具等）全部直连物理网卡。修改规则在连接中立即热生效。</p>
+            </div>
+          </div>
+
+          <div class="process-toolbar">
+            <button id="pickRunningBtn" class="btn btn-primary" type="button">从运行中程序选择</button>
+            <button id="browseExeBtn" class="btn btn-secondary" type="button">浏览 EXE...</button>
+            <button id="browseDirBtn" class="btn btn-secondary" type="button">选择文件夹...</button>
+            <div class="manual-add">
+              <input id="manualProcInput" type="text" placeholder="输入进程名或路径（如 msedge.exe）" autocomplete="off" />
+              <button id="addManualBtn" class="btn btn-secondary" type="button">添加</button>
+            </div>
+          </div>
+
+          <div id="processFeedback" class="process-feedback hidden"></div>
+
+          <div class="card process-list-wrap">
+            <ul id="processRuleList" class="process-list"></ul>
+            <div id="processEmptyState" class="empty-state hidden">尚未添加分流程序，请点击上方按钮从运行中程序选择或浏览 EXE。</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 日志页 -->
+      <section id="tab-logs" class="tab-pane">
+        <div class="logs-layout">
+          <div class="logs-header">
+            <h2>运行日志</h2>
+            <div class="logs-actions">
+              <button id="copyLogsBtn" class="btn btn-secondary btn-sm" type="button">复制</button>
+              <button id="clearLogsBtn" class="btn btn-secondary btn-sm" type="button">清空</button>
+            </div>
+          </div>
+          <div id="logContainer" class="log-terminal"></div>
+        </div>
+      </section>
+    </main>
+
+    <!-- 底部栏 -->
+    <footer class="footer">
+      <div class="footer-row">
+        <span class="footer-label">目录</span>
+        <span id="dataDirText" class="footer-path"></span>
+        <button id="openDirBtn" class="btn btn-secondary btn-sm" type="button">打开目录</button>
+      </div>
+      <div class="footer-row">
+        <span class="footer-label">流量</span>
+        <span id="trafficText" class="footer-traffic">上行 0 B · 下行 0 B</span>
+        <button id="resetTrafficBtn" class="btn btn-secondary btn-xs" type="button">重置</button>
+      </div>
+    </footer>
+  </div>
+
+  <!-- 模态框：服务器管理 -->
+  <div id="serverModal" class="modal hidden">
+    <div class="modal-card modal-md">
+      <div class="modal-header">
+        <h3>服务器列表管理</h3>
+        <button class="modal-close" data-close="serverModal" type="button">×</button>
+      </div>
+      <div class="modal-body">
+        <ul id="manageServerList" class="manage-list"></ul>
+        <div id="manageServerEmpty" class="empty-state hidden">暂无服务器，请点击下方“新增服务器”。</div>
+      </div>
+      <div class="modal-footer">
+        <div class="left-actions">
+          <button id="modalAddServerBtn" class="btn btn-primary btn-sm" type="button">新增</button>
+          <button id="modalEditServerBtn" class="btn btn-secondary btn-sm" type="button">编辑</button>
+          <button id="modalDeleteServerBtn" class="btn btn-danger btn-sm" type="button">删除</button>
+        </div>
+        <button class="btn btn-secondary btn-sm" data-close="serverModal" type="button">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模态框：单个服务器编辑 -->
+  <div id="serverEditModal" class="modal hidden">
+    <div class="modal-card modal-sm">
+      <div class="modal-header">
+        <h3 id="serverEditTitle">编辑服务器</h3>
+        <button class="modal-close" data-close="serverEditModal" type="button">×</button>
+      </div>
+      <div class="modal-body form-stack">
+        <div class="field-group">
+          <label for="editNameInput">服务器名称</label>
+          <input id="editNameInput" type="text" autocomplete="off" />
+        </div>
+        <div class="field-group">
+          <label for="editAddrInput">服务器地址</label>
+          <input id="editAddrInput" type="text" placeholder="域名、IP 或 主机:端口" autocomplete="off" />
+        </div>
+        <div class="field-row">
+          <div class="field-group flex-1">
+            <label for="editUserInput">用户名</label>
+            <input id="editUserInput" type="text" autocomplete="off" />
+          </div>
+          <div class="field-group port-col">
+            <label for="editPortInput">代理端口</label>
+            <input id="editPortInput" type="text" maxlength="5" value="1080" autocomplete="off" />
+          </div>
+        </div>
+        <div class="field-group">
+          <label for="editPassInput">密码</label>
+          <input id="editPassInput" type="password" autocomplete="off" />
+        </div>
+        <div class="field-group">
+          <label for="editDnsInput">自定义 DNS（可选）</label>
+          <input id="editDnsInput" type="text" placeholder="留空使用 Fake-IP" autocomplete="off" />
+        </div>
+        <div id="editModalError" class="validation-error hidden"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary btn-sm" data-close="serverEditModal" type="button">取消</button>
+        <button id="editModalSaveBtn" class="btn btn-primary btn-sm" type="button">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模态框：选择运行中进程 -->
+  <div id="runningProcModal" class="modal hidden">
+    <div class="modal-card modal-md">
+      <div class="modal-header">
+        <h3>选择正在运行的程序</h3>
+        <button class="modal-close" data-close="runningProcModal" type="button">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="running-search">
+          <input id="runningSearchInput" type="text" placeholder="搜索进程名称或路径（例如 edge、chrome、curl）..." autocomplete="off" />
+          <button id="refreshRunningBtn" class="btn btn-secondary btn-sm" type="button">刷新</button>
+        </div>
+        <ul id="runningProcList" class="running-list"></ul>
+      </div>
+      <div class="modal-footer">
+        <span id="runningSelectedHint" class="footer-label">选择要加入分流的程序</span>
+        <div class="left-actions">
+          <button class="btn btn-secondary btn-sm" data-close="runningProcModal" type="button">取消</button>
+          <button id="confirmRunningBtn" class="btn btn-primary btn-sm" type="button">添加选中</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模态框：通用确认框 -->
+  <div id="confirmModal" class="modal hidden">
+    <div class="modal-card modal-xs">
+      <div class="modal-header">
+        <h3 id="confirmTitle">确认</h3>
+      </div>
+      <div class="modal-body">
+        <p id="confirmMessage" class="confirm-msg"></p>
+      </div>
+      <div class="modal-footer">
+        <button id="confirmCancelBtn" class="btn btn-secondary btn-sm" type="button">取消</button>
+        <button id="confirmOkBtn" class="btn btn-primary btn-sm" type="button">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="./app.js"></script>
+</body>
+</html>

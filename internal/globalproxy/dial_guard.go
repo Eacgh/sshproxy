@@ -17,12 +17,17 @@ const (
 	// 所以从短冷却开始，最多暂停 1 分钟。
 	targetTimeoutInitialCooldown = 5 * time.Second
 	targetTimeoutMaximumCooldown = time.Minute
+	// 目标状态在“无活跃调用且熔断已结束”后保留的时长；超过后从跟踪表删除，
+	// 避免大量不可达目标在长时间运行中无限占用内存。
+	idleTargetLifetime = 5 * time.Minute
 )
 
 type targetDialState struct {
 	slots           chan struct{}
 	blockedUntil    time.Time
 	timeoutFailures int
+	users           int
+	lastActivity    time.Time
 }
 
 // dialGuard 限制尚未建立的 SSH 通道。已建立后的下载连接不会占用名额，
@@ -45,13 +50,20 @@ func (g *dialGuard) acquire(ctx context.Context, target string) (func(), error) 
 	if err != nil {
 		return nil, err
 	}
+	g.mu.Lock()
+	state.users++
+	state.lastActivity = time.Now()
+	g.mu.Unlock()
+	releaseTarget := func() { g.releaseTargetDial(target, state) }
 	select {
 	case state.slots <- struct{}{}:
 	case <-ctx.Done():
+		releaseTarget()
 		return nil, ctx.Err()
 	}
 	if remaining := g.cooldownRemaining(state); remaining > 0 {
 		<-state.slots
+		releaseTarget()
 		return nil, targetCoolingDownError{remaining: remaining}
 	}
 	// 先取得同目标名额，再占全局名额；否则同一域名的大量等待请求会
@@ -60,12 +72,14 @@ func (g *dialGuard) acquire(ctx context.Context, target string) (func(), error) 
 	case g.global <- struct{}{}:
 	case <-ctx.Done():
 		<-state.slots
+		releaseTarget()
 		return nil, ctx.Err()
 	}
 
 	return func() {
 		<-g.global
 		<-state.slots
+		releaseTarget()
 	}, nil
 }
 
@@ -74,6 +88,7 @@ func (g *dialGuard) targetState(target string) (*targetDialState, error) {
 	defer g.mu.Unlock()
 	state := g.targets[target]
 	if state == nil {
+		g.pruneStaleTargetsLocked()
 		state = &targetDialState{slots: make(chan struct{}, maxConcurrentTargetDials)}
 		g.targets[target] = state
 	}
@@ -81,6 +96,23 @@ func (g *dialGuard) targetState(target string) (*targetDialState, error) {
 		return nil, targetCoolingDownError{remaining: remaining}
 	}
 	return state, nil
+}
+
+// pruneStaleTargetsLocked 删除长时间没有活跃调用且已结束熔断的目标状态。
+func (g *dialGuard) pruneStaleTargetsLocked() {
+	cutoff := time.Now().Add(-idleTargetLifetime)
+	for key, state := range g.targets {
+		if state.users == 0 && state.lastActivity.Before(cutoff) && !time.Now().Before(state.blockedUntil) {
+			delete(g.targets, key)
+		}
+	}
+}
+
+func (g *dialGuard) releaseTargetDial(target string, state *targetDialState) {
+	g.mu.Lock()
+	state.users--
+	state.lastActivity = time.Now()
+	g.mu.Unlock()
 }
 
 func (g *dialGuard) cooldownRemaining(state *targetDialState) time.Duration {
@@ -102,9 +134,11 @@ func (g *dialGuard) record(target string, err error) {
 	if err == nil {
 		state.blockedUntil = time.Time{}
 		state.timeoutFailures = 0
+		state.lastActivity = time.Now()
 		return
 	}
 	state.timeoutFailures++
+	state.lastActivity = time.Now()
 	// 5s、10s、20s、40s、60s（16 倍后按上限截断），最多暂停 1 分钟。
 	multiplier := 1 << min(state.timeoutFailures-1, 4)
 	cooldown := time.Duration(multiplier) * targetTimeoutInitialCooldown

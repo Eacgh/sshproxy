@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"strings"
@@ -120,6 +121,54 @@ func rawIPv4(address windows.RawSockaddrInet) (net.IP, bool) {
 	return net.IPv4(value.Addr[0], value.Addr[1], value.Addr[2], value.Addr[3]), true
 }
 
+func rawIPv6(address windows.RawSockaddrInet) (netip.Addr, bool) {
+	if address.Family != windows.AF_INET6 {
+		return netip.Addr{}, false
+	}
+	value := (*windows.RawSockaddrInet6)(unsafe.Pointer(&address))
+	return netip.AddrFrom16(value.Addr), true
+}
+
+func findDefaultIPv6InterfaceIndex() uint32 {
+	var table *windows.MibIpForwardTable2
+	if err := windows.GetIpForwardTable2(windows.AF_INET6, &table); err != nil {
+		return 0
+	}
+	defer windows.FreeMibTable(unsafe.Pointer(table))
+
+	var selectedIndex uint32
+	var selectedMetric uint64
+	found := false
+	for _, row := range table.Rows() {
+		if row.DestinationPrefix.PrefixLength != 0 {
+			continue
+		}
+		prefix, ok := rawIPv6(row.DestinationPrefix.Prefix)
+		if !ok || !prefix.IsUnspecified() {
+			continue
+		}
+		gateway, ok := rawIPv6(row.NextHop)
+		if !ok || gateway.IsUnspecified() {
+			continue
+		}
+		iface, err := net.InterfaceByIndex(int(row.InterfaceIndex))
+		if err != nil || iface.Flags&net.FlagLoopback != 0 || iface.Name == adapterName {
+			continue
+		}
+		metric := uint64(row.Metric)
+		interfaceRow := windows.MibIpInterfaceRow{Family: windows.AF_INET6, InterfaceIndex: row.InterfaceIndex}
+		if err := windows.GetIpInterfaceEntry(&interfaceRow); err == nil {
+			metric += uint64(interfaceRow.Metric)
+		}
+		if !found || metric < selectedMetric {
+			selectedIndex = row.InterfaceIndex
+			selectedMetric = metric
+			found = true
+		}
+	}
+	return selectedIndex
+}
+
 func hasIPv4Route(prefix net.IP, prefixLength uint8, interfaceIndex uint32, gateway net.IP) bool {
 	var table *windows.MibIpForwardTable2
 	if err := windows.GetIpForwardTable2(windows.AF_INET, &table); err != nil {
@@ -173,6 +222,53 @@ func configuredDNSServers() ([]net.IP, error) {
 			}
 		}
 		return servers, nil
+	}
+}
+
+// physicalIPv4DNSServers 读取物理网卡原配置的 IPv4 DNS，优先使用默认出口网卡的 DNS，
+// 供按进程分流模式下直连进程在绕过 Wintun 时解析真实域名。
+func physicalIPv4DNSServers(preferredIndex uint32) ([]netip.Addr, error) {
+	size := uint32(15000)
+	for {
+		buffer := make([]byte, size)
+		first := (*windows.IpAdapterAddresses)(unsafe.Pointer(&buffer[0]))
+		err := windows.GetAdaptersAddresses(windows.AF_UNSPEC, 0, 0, first, &size)
+		if errors.Is(err, windows.ERROR_BUFFER_OVERFLOW) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("读取物理网卡 DNS 配置失败：%w", err)
+		}
+
+		var preferred []netip.Addr
+		var others []netip.Addr
+		seen := make(map[netip.Addr]struct{})
+		for adapter := first; adapter != nil; adapter = adapter.Next {
+			if adapter.OperStatus != windows.IfOperStatusUp || windows.UTF16PtrToString(adapter.FriendlyName) == adapterName {
+				continue
+			}
+			for current := adapter.FirstDnsServerAddress; current != nil; current = current.Next {
+				ipBytes := current.Address.IP()
+				addr, ok := netip.AddrFromSlice(ipBytes)
+				if !ok {
+					continue
+				}
+				addr = addr.Unmap()
+				if !addr.Is4() || addr.IsUnspecified() || addr.IsLoopback() {
+					continue
+				}
+				if _, exists := seen[addr]; exists {
+					continue
+				}
+				seen[addr] = struct{}{}
+				if adapter.IfIndex == preferredIndex {
+					preferred = append(preferred, addr)
+				} else {
+					others = append(others, addr)
+				}
+			}
+		}
+		return append(preferred, others...), nil
 	}
 }
 
@@ -238,7 +334,12 @@ func configureNetwork(ctx context.Context, route defaultRoute, serverIP net.IP, 
 	)
 
 	for _, arguments := range commands {
-		if err := runNetshCommand(ctx, arguments...); err != nil {
+		// 每条 netsh 命令单独设置期限，避免启动路径上命令异常挂起卡住整个程序；
+		// 清理路径同样受 networkCommandTTL 保护。
+		commandCtx, cancel := context.WithTimeout(ctx, networkCommandTTL)
+		err := runNetshCommand(commandCtx, arguments...)
+		cancel()
+		if err != nil {
 			configuration.cleanup(context.Background())
 			return nil, fmt.Errorf("配置 Windows 全局路由失败：%w", err)
 		}
@@ -316,6 +417,9 @@ func cleanupNetworkState(ctx context.Context, state persistedNetworkState, logge
 		[]string{"interface", "ipv4", "delete", "dnsservers", "name=" + state.AdapterName, "address=all", "validate=no"},
 		[]string{"interface", "ipv6", "delete", "address", "interface=" + state.AdapterName, "address=" + tunnelIPv6, "store=active"},
 		[]string{"interface", "ipv4", "delete", "address", "name=" + state.AdapterName, "address=" + tunnelIPv4, "store=active"},
+		// 最后删除 Wintun 虚拟网卡本身：适配器是本次运行创建的临时设备，
+		// 不删除会残留在 Windows“网络连接”中，跨重启仍然可见。
+		[]string{"interface", "delete", "interface", "name=" + state.AdapterName},
 	)
 	for _, arguments := range commands {
 		if err := runNetshCommand(ctx, arguments...); err != nil {
@@ -328,10 +432,9 @@ func cleanupNetworkState(ctx context.Context, state persistedNetworkState, logge
 }
 
 // Recover 清理上次异常退出遗留的路由。状态文件只由程序生成，不需要用户维护。
+// 无论本次是否启用全局模式都应调用：残留的 /1 路由会把整机流量送进不再
+// 有进程处理的虚拟网卡，导致断网，必须尽快清理。
 func Recover(logger *slog.Logger) error {
-	if !isElevated() {
-		return errors.New("启用全局模式需要管理员权限，请以管理员身份启动 SSH VPN")
-	}
 	statePath, err := portableFile(networkStateFile)
 	if err != nil {
 		return err
@@ -342,6 +445,9 @@ func Recover(logger *slog.Logger) error {
 	}
 	if err != nil {
 		return fmt.Errorf("读取上次网络恢复状态失败：%w", err)
+	}
+	if !isElevated() {
+		return errors.New("发现上次全局模式遗留的临时网络设置；清理需要管理员权限，请以管理员身份启动 SSH VPN")
 	}
 	var state persistedNetworkState
 	if err := json.Unmarshal(data, &state); err != nil {

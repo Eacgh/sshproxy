@@ -1,10 +1,11 @@
 /bin/
 /.cache/
+/.go-cache/
+/.go-tmp/
 /artifacts/
-/gui/**/bin/
-/gui/**/obj/
-/gui/SshVpn.Gui/Resources/sshvpn-core.exe
+/.webview2/
 /sshvpn.exe
+/SshVpn.exe
 /config.json
 config.json.tmp
 /servers.json
@@ -12,10 +13,11 @@ servers.json.tmp
 /traffic.json
 traffic.json.tmp
 known_hosts
-sshvpn-core.exe.tmp
 /wintun.dll
 wintun.dll.tmp
 /network-state.json
 network-state.json.tmp
+/processes.json
+processes.json.tmp
 *.log
 /.zcode/

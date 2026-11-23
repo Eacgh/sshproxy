@@ -2,7 +2,9 @@ package stats
 
 import (
 	"context"
+	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -142,4 +144,87 @@ func containsTraffic(output string) bool {
 		}
 	}
 	return true
+}
+
+func TestCopyBufferAccountsTrafficBeforeClose(t *testing.T) {
+	traffic := new(Traffic)
+	srcWriter, srcReader := net.Pipe()
+	dstReader, dstWriter := net.Pipe()
+	defer srcWriter.Close()
+	defer srcReader.Close()
+	defer dstReader.Close()
+	defer dstWriter.Close()
+
+	copyDone := make(chan error, 1)
+	go func() {
+		_, err := traffic.CopyBuffer(dstWriter, srcReader, make([]byte, 1024), true)
+		copyDone <- err
+	}()
+
+	payload := []byte("streaming-upload-chunk")
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := srcWriter.Write(payload)
+		writeDone <- err
+	}()
+
+	received := make([]byte, len(payload))
+	if _, err := io.ReadFull(dstReader, received); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
+	}
+
+	// 连接尚未关闭，实时统计就已经完成累加。
+	deadline := time.Now().Add(time.Second)
+	for {
+		upload, download := traffic.Snapshot()
+		if upload == uint64(len(payload)) && download == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("连接未关闭时流量未实时累加：upload=%d download=%d", upload, download)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// 下行方向同样在未关闭时实时记账。
+	dlSrcWriter, dlSrcReader := net.Pipe()
+	dlDstReader, dlDstWriter := net.Pipe()
+	defer dlSrcWriter.Close()
+	defer dlSrcReader.Close()
+	defer dlDstReader.Close()
+	defer dlDstWriter.Close()
+
+	dlDone := make(chan error, 1)
+	go func() {
+		_, err := traffic.CopyBuffer(dlDstWriter, dlSrcReader, nil, false)
+		dlDone <- err
+	}()
+	dlPayload := []byte("download-chunk")
+	go func() { _, _ = dlSrcWriter.Write(dlPayload) }()
+	if _, err := io.ReadFull(dlDstReader, make([]byte, len(dlPayload))); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(time.Second)
+	for {
+		_, download := traffic.Snapshot()
+		if download == uint64(len(dlPayload)) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("下行流量未实时累加：download=%d", download)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	srcWriter.Close()
+	dlSrcWriter.Close()
+	if err := <-copyDone; err != nil {
+		t.Fatalf("上行 CopyBuffer 返回错误：%v", err)
+	}
+	if err := <-dlDone; err != nil {
+		t.Fatalf("下行 CopyBuffer 返回错误：%v", err)
+	}
 }

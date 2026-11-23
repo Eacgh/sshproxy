@@ -26,8 +26,9 @@ func isFakeAddress(address netip.Addr) bool {
 }
 
 type fakeDNSAddresses struct {
-	ipv4 netip.Addr
-	ipv6 netip.Addr
+	ipv4     netip.Addr
+	ipv6     netip.Addr
+	lastUsed time.Time
 }
 
 // fakeDNSResolver 给域名分配仅在本次运行中有效的保留地址。
@@ -111,12 +112,25 @@ func normalizedDNSName(name dnsmessage.Name) string {
 func (r *fakeDNSResolver) addressesFor(name string) (fakeDNSAddresses, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	now := time.Now()
 	if addresses, ok := r.addresses[name]; ok {
+		addresses.lastUsed = now
+		r.addresses[name] = addresses
 		r.cache.store(name, addresses.ipv4, fakeDNSMappingTTL)
 		r.cache.store(name, addresses.ipv6, fakeDNSMappingTTL)
 		return addresses, nil
 	}
 	if r.next >= fakeIPv4AddressMax {
+		// 地址池耗尽：优先回收“缓存映射已过期”的地址。只回收映射已经过期的
+		// 条目，仍在映射中的地址若被重新分配，会让老域名剩余连接被导向新
+		// 域名（串站），宁可报错也不冒险。
+		if addresses, ok := r.reclaimExpiredLocked(name); ok {
+			addresses.lastUsed = now
+			r.addresses[name] = addresses
+			r.cache.store(name, addresses.ipv4, fakeDNSMappingTTL)
+			r.cache.store(name, addresses.ipv6, fakeDNSMappingTTL)
+			return addresses, nil
+		}
 		return fakeDNSAddresses{}, errors.New("Fake-IP 地址池已经耗尽")
 	}
 	sequence := r.next + 1
@@ -135,9 +149,25 @@ func (r *fakeDNSResolver) addressesFor(name string) (fakeDNSAddresses, error) {
 	ipv6Bytes[14] = byte(sequence >> 8)
 	ipv6Bytes[15] = byte(sequence)
 	ipv6 := netip.AddrFrom16(ipv6Bytes)
-	addresses := fakeDNSAddresses{ipv4: ipv4, ipv6: ipv6}
+	addresses := fakeDNSAddresses{ipv4: ipv4, ipv6: ipv6, lastUsed: now}
 	r.addresses[name] = addresses
 	r.cache.store(name, ipv4, fakeDNSMappingTTL)
 	r.cache.store(name, ipv6, fakeDNSMappingTTL)
 	return addresses, nil
+}
+
+// reclaimExpiredLocked 在地址池耗尽时回收缓存映射已经过期的地址。
+// 只有映射过期（域名不再活跃）的地址才会被回收，避免新域名与旧域名
+// 共享同一个 Fake-IP 导致串站。调用方必须持有 mu。
+func (r *fakeDNSResolver) reclaimExpiredLocked(name string) (fakeDNSAddresses, bool) {
+	for oldName, entry := range r.addresses {
+		if oldName == name {
+			continue
+		}
+		if _, _, ok := r.cache.lookupTarget(entry.ipv4); !ok {
+			delete(r.addresses, oldName)
+			return entry, true
+		}
+	}
+	return fakeDNSAddresses{}, false
 }

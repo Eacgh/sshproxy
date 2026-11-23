@@ -49,7 +49,7 @@ func newCustomDNSResolver(dialer Dialer, address string, fake *fakeDNSResolver, 
 		logger:   logger,
 	}
 	for index := range resolver.forwards {
-		resolver.forwards[index] = &forwardingDNSResolver{dialer: dialer, address: address}
+		resolver.forwards[index] = newForwardingDNSResolver(dialer, address)
 	}
 	return resolver
 }
@@ -61,6 +61,21 @@ func (r *customDNSResolver) inCooldown() bool {
 		return false
 	}
 	return time.Since(time.Unix(0, since)) < customDNSRetryInterval
+}
+
+// enterCooldown 在当前未处于冷却期（或上轮冷却已到期）时刷新失败时间戳，
+// 避免并发失败把冷却窗口无限推后，同时确保冷却到期后再次失败能重新进入冷却。
+func (r *customDNSResolver) enterCooldown() {
+	now := time.Now()
+	for {
+		since := r.unavailableSince.Load()
+		if since != 0 && now.Sub(time.Unix(0, since)) < customDNSRetryInterval {
+			return
+		}
+		if r.unavailableSince.CompareAndSwap(since, now.UnixNano()) {
+			return
+		}
+	}
 }
 
 // resolve 使用用户指定的 DNS 获得真实 IPv4，但只向 Windows 返回 Fake-IP。
@@ -83,20 +98,20 @@ func (r *customDNSResolver) resolve(ctx context.Context, payload []byte) ([]byte
 		return emptyDNSResponse(query)
 	}
 
-	forward := r.forwards[(r.next.Add(1)-1)%uint32(len(r.forwards))]
+	forwardCount := uint32(len(r.forwards))
+	start := (r.next.Add(1) - 1) % forwardCount
+	forward := r.forwards[start]
 	upstreamPayload, err := forward.resolve(ctx, payload)
 	if err != nil && ctx.Err() == nil {
 		// 首条通道失败后再换一条独立通道重试一次，排除单条 SSH 通道的瞬时问题。
-		forward = r.forwards[(r.next.Add(1))%uint32(len(r.forwards))]
+		forward = r.forwards[(start+1)%forwardCount]
 		upstreamPayload, err = forward.resolve(ctx, payload)
 	}
 	if err != nil {
 		// 经 SSH 查询自定义 DNS 失败（服务器到该 DNS 不可达），降级为
-		// 域名交给 SSH 服务器解析，保证页面仍然可用；保留最早的失败时间，
-		// 避免并发失败不断把冷却窗口往后推。
-		if r.unavailableSince.Load() == 0 {
-			r.unavailableSince.Store(time.Now().UnixNano())
-		}
+		// 域名交给 SSH 服务器解析，保证页面仍然可用；未处于冷却期时刷新
+		// 失败时间戳，避免冷却到期后重试依然失败却失去冷却保护。
+		r.enterCooldown()
 		r.logger.Warn("自定义 DNS 经 SSH 查询失败，冷却期内回退到 SSH 服务器解析域名", "错误", err)
 		return r.fake.resolve(payload)
 	}
@@ -208,44 +223,79 @@ type forwardingDNSResolver struct {
 	dialer  Dialer
 	address string
 
+	// semaphore 限制同一通道同时只有一个查询，避免复用连接上的请求互相串扰。
+	// 与互斥锁不同，等待闸门响应调用方的上下文取消，不会让慢查询之外的
+	// 请求干等整段超时时间。
+	semaphore chan struct{}
+
 	mu         sync.Mutex
 	connection net.Conn
 	lastUsed   time.Time
 }
 
+func newForwardingDNSResolver(dialer Dialer, address string) *forwardingDNSResolver {
+	return &forwardingDNSResolver{
+		dialer:    dialer,
+		address:   address,
+		semaphore: make(chan struct{}, 1),
+	}
+}
+
 // resolve 把 DNS 数据封装为 DNS-over-TCP，并通过 SSH 访问用户指定的服务器。
 // 所有查询复用同一条 TCP 连接，避免反复建立 SSH 通道。
 func (r *forwardingDNSResolver) resolve(ctx context.Context, payload []byte) ([]byte, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.connection != nil && time.Since(r.lastUsed) >= dnsConnectionMaxIdle {
-		r.connection.Close()
-		r.connection = nil
+	select {
+	case r.semaphore <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
-	if r.connection != nil {
-		response, err := exchangeReusedDNS(ctx, r.connection, payload)
+	defer func() { <-r.semaphore }()
+
+	r.mu.Lock()
+	connection := r.connection
+	if connection != nil && time.Since(r.lastUsed) >= dnsConnectionMaxIdle {
+		connection.Close()
+		r.connection = nil
+		connection = nil
+	}
+	r.mu.Unlock()
+
+	if connection != nil {
+		response, err := exchangeReusedDNS(ctx, connection, payload)
 		if err == nil {
+			r.mu.Lock()
 			r.lastUsed = time.Now()
+			r.mu.Unlock()
 			return response, nil
 		}
-		r.connection.Close()
-		r.connection = nil
+		connection.Close()
+		r.mu.Lock()
+		if r.connection == connection {
+			r.connection = nil
+		}
+		r.mu.Unlock()
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 	}
 
-	connection, err := r.dialer.DialContext(ctx, "tcp", r.address)
+	fresh, err := r.dialer.DialContext(ctx, "tcp", r.address)
 	if err != nil {
 		return nil, fmt.Errorf("通过 SSH 连接自定义 DNS %s 失败：%w", r.address, err)
 	}
-	response, err := exchangeDNS(ctx, connection, payload)
+	response, err := exchangeDNS(ctx, fresh, payload)
 	if err != nil {
-		connection.Close()
+		fresh.Close()
 		return nil, fmt.Errorf("查询自定义 DNS %s 失败：%w", r.address, err)
 	}
-	r.connection = connection
-	r.lastUsed = time.Now()
+	r.mu.Lock()
+	if r.connection == nil {
+		r.connection = fresh
+		r.lastUsed = time.Now()
+	} else {
+		fresh.Close()
+	}
+	r.mu.Unlock()
 	return response, nil
 }
 

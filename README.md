@@ -1,56 +1,44 @@
-# sshvpn 核心程序
+# SSH VPN（纯 Go 版）
 
-程序连接 SSH 服务器，在本机提供 SOCKS5 代理，并可通过 Wintun 接管 Windows 全局 TCP 流量。
+程序通过单条可复用 SSH 连接提供本机 SOCKS5 代理，并可借助 Wintun 虚拟网卡与 gVisor 用户态协议栈在 Windows 上实现**全局 TCP 代理**或**按进程分流代理**。
+
+整个软件已全面重构为**纯 Go 单体架构**（基于 Wails v2 + WebView2 与纯 Go Win32 系统托盘，零 C#/WPF、零 DLL 注入 Hook、零 CGO），单文件便携版仅约 17 MB。
 
 ## 图形界面
 
-项目提供中文 WPF 图形界面。发布包只有一个 `SshVpn.exe`；首次启动时，GUI 会把内嵌的 Go 核心释放到同目录。运行后的目录结构为：
+发布产物为单一绿色可执行文件 `SshVpn.exe`，全部配置、日志、密钥与 WebView2 运行目录均保存在 EXE 同目录，不写入 AppData 或其他用户目录：
 
 ```text
-SshVpn.exe          GUI 主程序
-sshvpn-core.exe     首次启动自动生成
-wintun.dll          首次启用全局模式时由核心自动生成
-servers.json        服务器列表（可管理多条服务器）
-traffic.json        累计流量统计（可随时重置）
-known_hosts         首次成功连接时自动生成
-network-state.json  全局模式运行时用于异常恢复，正常断开后删除
-logs/               每次启动生成 日期-标识.log 运行日志，便于排查问题
+SshVpn.exe          纯 Go 图形主程序（内嵌核心引擎与 wintun.dll）
+wintun.dll          首次启用全局或按进程分流模式时自动释放
+servers.json        服务器列表（支持多条服务器）
+processes.json      按进程分流白名单（可选）
+traffic.json        累计流量统计（支持运行中热清零）
+known_hosts         首次成功连接时自动生成（TOFU 主机密钥校验）
+network-state.json  Wintun 异常退出恢复状态，正常断开后删除
+logs/               每次启动生成 日期-标识.log 运行日志
+.webview2/          便携版 WebView2 运行数据目录
 ```
 
-GUI 支持：
+GUI 支持三种互斥工作模式：
 
-- 左侧服务器列表管理多条服务器配置，右侧编辑选中服务器的连接参数，可增删改。
-- 启动、正常停止 Go 核心并显示实时日志。
-- 使用 Wintun 接管 IPv4/IPv6 TCP 流量，并通过本地 Fake-IP 把域名交给 SSH 服务器解析。
-- 连接前恢复上次异常退出遗留的临时路由，断开时自动还原网络。
-- 左下角实时显示累计上行/下行流量，支持一键重置。
-- 点击最小化或右上角关闭按钮时隐藏到系统托盘，通过托盘连接、断开或真正退出。
-- 显示当前 SOCKS5 地址和运行状态。
+1. **按进程分流（Wintun，推荐桌面多软件场景）**：
+   - 使用 Wintun + gVisor 接管流量后，通过 Windows `GetExtendedTcpTable` / `GetExtendedUdpTable` 根据连接源端口反查进程 PID 与完整路径。
+   - **命中白名单的程序（包含 Edge、Chrome 等多进程浏览器的所有同名网络子进程）**：TCP 流量经 SSH 隧道转发；同时阻止其非 DNS UDP，迫使浏览器 QUIC 回退到 TCP，防止 UDP 旁路泄漏。
+   - **未命中白名单的程序（如 Firefox、本地管理工具、游戏与语音）**：TCP 与 UDP 均通过 `IP_UNICAST_IF` / `IPV6_UNICAST_IF` 绑定**原物理网卡**直连出网（若遇 Fake-IP 会自动还原域名并通过物理网卡原有 DNS 解析）。
+   - 在「进程分流」页支持从当前运行中程序勾选添加、浏览 `.exe` 或手动输入进程名，并在连接运行中热更新规则立即生效。
+2. **全局模式（Wintun TCP）**：接管整机 IPv4/IPv6 TCP 流量并由 SSH 解析域名，阻止非 DNS UDP。
+3. **仅 SOCKS5 代理**：仅在本机 `127.0.0.1:<端口>` 监听无认证 SOCKS5 代理，不创建虚拟网卡与系统路由。
 
-程序自己的配置、核心、日志和恢复状态都只保存在 EXE 同目录，不会写入 AppData 或用户目录。程序目录必须可写，请把便携版放在桌面或自选目录，不要放入 `Program Files`。更新 `SshVpn.exe` 后，GUI 会通过哈希比较自动更新同目录的核心，不会删除已有的 `servers.json` 和 `known_hosts`。
+其他界面特性：
+- 左侧服务器列表管理多条服务器配置，右侧保存后自动遮挡锁定，点击「编辑」才显示完整参数。
+- 底部实时显示累计上行/下行流量（流式实时计数），支持连接状态下免重启一键重置。
+- 点击右上角关闭按钮隐藏到纯 Go Win32 系统托盘，支持托盘双击恢复、快速连接/断开或彻底退出。
+- 程序目录必须可写，请放在桌面或自选目录，不要放在 `Program Files`。首次使用 Wintun 或修改路由需要管理员权限，启动时将触发 Windows UAC。
 
-全局模式需要管理员权限，GUI 启动时会显示 Windows UAC。虚拟网卡属于内核驱动，Windows 必须把官方签名的 Wintun 驱动安装到 Driver Store，并维护必要的设备注册表状态；这是虚拟网卡工作的系统要求。程序不会把用户配置写入这些位置。
+## 配置与兼容
 
-## 全局模式
-
-GUI 默认勾选“启用全局模式（TCP）”。内部网络参数完全由程序管理；只有用户主动填写自定义 DNS 时才会增加对应的可选配置字段：
-
-1. 建立 SSH 连接并记录服务器实际 IPv4。
-2. 自动释放并加载官方 `wintun.dll 0.14.1`。
-3. 为 SSH 服务器添加 `/32` 直连路由，避免隧道递归。
-4. IPv4 和 IPv6 分别使用两个 `/1` 路由接管流量，不删除用户原有默认路由。
-5. 自动记录当前 DNS 地址并添加临时主机路由，然后在本机返回保留范围内的 Fake-IP。默认模式不访问公共 DNS，真实域名只交给 SSH 服务器解析；自定义模式通过 SSH 查询用户指定的 DNS，但仍只向 Windows 返回 Fake-IP，并优先使用其 IPv4 结果。启用和断开时会自动清理 Windows DNS 缓存。
-6. TCP 连接根据 Fake-IP 恢复域名或自定义 DNS 的真实 IPv4；绕过系统 DNS 的 HTTPS 则根据 TLS ClientHello 中公开的 SNI 回退，避免浏览器缓存的旧 Fake-IP 被发往远端。程序不会解密或修改 TLS 内容。
-7. 同一目标允许少量并发探测，全局最多同时探测 12 个目标；目标超时后从 5 秒开始指数延长暂停时间（最多 1 分钟）并合并重复日志，避免大量不可达的后台连接拖慢正在使用的网站。已经建立的连接不占探测名额，不会限制正常下载吞吐。
-8. 断开时删除临时地址和路由；异常退出后在下次连接前根据 `network-state.json` 自动恢复。
-
-当前阶段普通 UDP 会被明确阻止，不会绕过 SSH。浏览器的 QUIC 通常会自动回退到 TCP；游戏、语音通话以及依赖 UDP 的软件可能无法使用。取消勾选全局模式后，程序只提供原来的 SOCKS5 代理。
-
-## 配置
-
-### GUI 模式：servers.json（多服务器列表）
-
-GUI 中点击“管理”可以增删服务器，左侧列表选中服务器后编辑账号、密码和代理端口，点击“保存配置”写入 `servers.json`：
+### servers.json（多服务器列表）
 
 ```json
 [
@@ -64,89 +52,73 @@ GUI 中点击“管理”可以增删服务器，左侧列表选中服务器后�
 ]
 ```
 
-- `name`：服务器名称，用于列表显示和核心启动时按名称加载。
-- `server_address`：SSH 服务器域名或 IP。未填写端口时自动使用 `22`，其他端口可写成 `ssh.example.com:2222`。
-- `username`：SSH 登录用户名。
-- `password`：SSH 登录密码。
-- `proxy_port`：本机 SOCKS5 代理端口，省略时默认使用 `1080`。
-- `dns_server`：可选字段，仅全局模式使用。留空时由 SSH 服务器解析域名；填写 DNS 的 IP 或 `IP:端口` 后，程序会通过 SSH 使用 DNS-over-TCP 查询该地址，把其 IPv4 结果保存在 Fake-IP 映射中，并向 Windows 返回空 AAAA 以兼容没有 IPv6 出口的 SSH 服务器。为避免启动时还要解析 DNS 服务器自身，此处不接受域名。
+- `name`：服务器名称，用于列表显示与 `-profile` 加载。
+- `server_address`：SSH 服务器域名或 IP。未填端口默认 `22`，自定义端口写成 `ssh.example.com:2222`。
+- `username` / `password`：SSH 登录凭证。
+- `proxy_port`：本机 SOCKS5 监听端口（固定绑定 `127.0.0.1`），默认 `1080`。
+- `dns_server`：可选字段，仅 Wintun 模式使用。留空时使用本地 Fake-IP 并把域名交给 SSH 服务器解析；填写 DNS IP 或 `IP:端口` 后通过 SSH 以 DNS-over-TCP 查询，仅向 Windows 返回 Fake-IP 与空 AAAA；按进程分流下未命中的直连程序仍使用物理网卡 DNS。
 
-首次从旧版本升级时，GUI 会自动用已有的 `config.json` 生成一个默认服务器条目。
+### processes.json（进程分流规则）
 
-### 命令行模式：config.json 或 servers.json + -profile
-
-不使用 GUI 时，核心既可以读取单文件 `config.json`，也可以配合 `-profile` 从服务器列表加载：
-
-```text
-sshvpn-core.exe -config config.json
-sshvpn-core.exe -profile 我的服务器
+```json
+[
+  {
+    "name": "msedge",
+    "path": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+    "enabled": true
+  }
+]
 ```
 
-程序固定监听 `127.0.0.1`，连接超时、SSH 保活和主机密钥都由程序内部管理。首次连接时会自动记录服务器主机密钥；如果以后密钥发生变化，程序会拒绝连接并给出安全提示。
+向后兼容旧版不含 `enabled` 字段的 `processes.json`（缺省视为启用）。
 
-`servers.json` 和 `config.json` 含有明文密码，已经被 `.gitignore` 排除。不要提交、发送或公开该文件。
+> `servers.json` 与 `config.json` 含明文密码，已加入 `.gitignore`，切勿提交或公开。
 
-## 运行
+## 命令行运行（CLI）
+
+不使用 GUI 时可直接运行无头命令行版本 `cmd/sshvpn`：
 
 ```powershell
 Copy-Item config.example.json config.json
 go run ./cmd/sshvpn -config config.json
 ```
 
-也可以从服务器列表按名称加载：
+或从 `servers.json` 按名称加载并选择代理模式：
 
 ```powershell
+# 仅本地 SOCKS5（默认）
 go run ./cmd/sshvpn -profile 我的服务器
+
+# 启用全局 TCP 模式（需管理员权限）
+go run ./cmd/sshvpn -profile 我的服务器 -mode=global -verbose
+
+# 启用按进程分流模式（读取同目录 processes.json，需管理员权限）
+go run ./cmd/sshvpn -profile 我的服务器 -mode=process -verbose
+
+# 清零累计流量统计
+go run ./cmd/sshvpn -profile 我的服务器 -reset-traffic
 ```
 
-运行期间按 `Ctrl+C` 会关闭所有本地连接和 SSH 通道后正常退出。默认只显示连接状态；需要查看每条 SOCKS5 连接时使用：
+## 构建（仅需 Go 1.26+）
+
+无需安装 .NET SDK 或 Visual Studio C++ 工具链：
 
 ```powershell
-go run ./cmd/sshvpn -config config.json -verbose
-```
+# 1. 运行单元测试
+go test -buildvcs=false -count=1 ./...
 
-以管理员身份运行下面的命令可以启用全局 TCP 模式：
+# 2. 更新 Windows 图标与 UAC 清单资源（如修改了 cmd/sshvpn-gui/assets/winres.json 或 app.ico）
+go run github.com/tc-hib/go-winres@latest make --in cmd/sshvpn-gui/assets/winres.json --out cmd/sshvpn-gui/rsrc --arch amd64
 
-```text
-go run ./cmd/sshvpn -config config.json -global -verbose
-```
+# 3. 构建单文件便携版 GUI
+go build -buildvcs=false -tags desktop,production -trimpath -ldflags="-s -w -H windowsgui" -o artifacts/sshvpn-portable/SshVpn.exe ./cmd/sshvpn-gui
 
-清零累计流量统计（跨重启持久化在 `traffic.json`）：
-
-```text
-go run ./cmd/sshvpn -config config.json -reset-traffic
-```
-
-另一个终端使用 `curl` 验证出口 IP：
-
-```powershell
-curl.exe --proxy socks5h://127.0.0.1:1080 https://ip.me/
-```
-
-## 构建单文件 GUI
-
-需要 Go 1.26 和 .NET 10 SDK。顺序固定为“先核心，后 GUI”。在仓库根目录依次执行：
-
-```text
-go test -buildvcs=false ./...
-go build -buildvcs=false -trimpath -ldflags="-s -w" -o gui/SshVpn.Gui/Resources/sshvpn-core.exe ./cmd/sshvpn
-dotnet publish gui/SshVpn.Gui/SshVpn.Gui.csproj -p:PublishProfile=Portable
-```
-
-发布结果位于 `artifacts\sshvpn-portable\SshVpn.exe`。第一次发布可能从 NuGet 下载 .NET 单文件发布所需的运行包，仓库中的 `NuGet.Config` 会把缓存固定到 `.cache\nuget`，不会写入用户 NuGet 目录。
-
-如果 Go 核心没有先生成，`dotnet publish` 会用中文错误明确中止，不会产出缺少核心的 GUI。
-
-## 单独构建 Go 核心
-
-不使用 GUI 时可以直接构建命令行版本：
-
-```text
+# 4. （可选）构建无头命令行版本
 go build -buildvcs=false -trimpath -ldflags="-s -w" -o bin/sshvpn.exe ./cmd/sshvpn
 ```
 
-全局模式仅支持 x64 Windows。内嵌的 tun2socks 使用 MIT 许可证；预编译 Wintun DLL 使用 WireGuard LLC 随官方压缩包提供的二进制许可证，原始许可证保存在 `internal/globalproxy/assets`。
+## 开源致谢
 
-## 致谢
-
-感谢 [LINUX DO](https://linux.do) 社区提供的交流与推广平台。
+- 内嵌 `tun2socks` 使用 MIT 许可证；预编译官方签名 `wintun.dll 0.14.1` 许可证保存在 `internal/globalproxy/assets/WINTUN-LICENSE.txt`。
+- GUI 使用 [Wails v2](https://wails.io) 与系统内置 Edge WebView2 运行时。
+- 感谢 [LINUX DO](https://linux.do) 社区提供的交流与推广平台。

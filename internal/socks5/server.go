@@ -335,12 +335,7 @@ func classifyDialError(err error) byte {
 func (s *Server) proxy(client, remote net.Conn) {
 	done := make(chan struct{}, 2)
 	copyOneWay := func(dst, src net.Conn, upload bool) {
-		bytes, _ := io.Copy(dst, src)
-		if upload {
-			s.stats.Add(uint64(bytes), 0)
-		} else {
-			s.stats.Add(0, uint64(bytes))
-		}
+		_, _ = s.stats.CopyBuffer(dst, src, nil, upload)
 		// 半关闭允许对端在请求体结束后继续返回剩余响应数据。
 		if closeWriter, ok := dst.(interface{ CloseWrite() error }); ok {
 			_ = closeWriter.CloseWrite()

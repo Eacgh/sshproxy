@@ -79,15 +79,12 @@ func TestCustomDNSResolverQueriesInParallel(t *testing.T) {
 
 func TestForwardingDNSResolverReplacesIdleConnection(t *testing.T) {
 	var dialCount atomic.Int32
-	resolver := &forwardingDNSResolver{
-		address: "9.9.9.9:53",
-		dialer: dialerFunc(func(context.Context, string, string) (net.Conn, error) {
-			dialCount.Add(1)
-			client, server := net.Pipe()
-			go serveTestDNSConnection(server, -1)
-			return client, nil
-		}),
-	}
+	resolver := newForwardingDNSResolver(dialerFunc(func(context.Context, string, string) (net.Conn, error) {
+		dialCount.Add(1)
+		client, server := net.Pipe()
+		go serveTestDNSConnection(server, -1)
+		return client, nil
+	}), "9.9.9.9:53")
 	defer resolver.close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -108,19 +105,16 @@ func TestForwardingDNSResolverReplacesIdleConnection(t *testing.T) {
 
 func TestForwardingDNSResolverRetriesHungReusedConnection(t *testing.T) {
 	var dialCount atomic.Int32
-	resolver := &forwardingDNSResolver{
-		address: "9.9.9.9:53",
-		dialer: dialerFunc(func(context.Context, string, string) (net.Conn, error) {
-			attempt := dialCount.Add(1)
-			client, server := net.Pipe()
-			if attempt == 1 {
-				go serveTestDNSConnection(server, 1)
-			} else {
-				go serveTestDNSConnection(server, -1)
-			}
-			return client, nil
-		}),
-	}
+	resolver := newForwardingDNSResolver(dialerFunc(func(context.Context, string, string) (net.Conn, error) {
+		attempt := dialCount.Add(1)
+		client, server := net.Pipe()
+		if attempt == 1 {
+			go serveTestDNSConnection(server, 1)
+		} else {
+			go serveTestDNSConnection(server, -1)
+		}
+		return client, nil
+	}), "9.9.9.9:53")
 	defer resolver.close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -364,5 +358,63 @@ func TestCustomDNSRetriesAfterCooldown(t *testing.T) {
 	}
 	if resolver.inCooldown() {
 		t.Fatal("自定义 DNS 重试成功后未清除冷却状态")
+	}
+}
+
+// TestCustomDNSReentersCooldownWhenRetryStillFails 验证冷却期结束后重试仍然失败时，
+// 会刷新时间戳并重新进入冷却，不会导致后续每次查询都反复超时。
+func TestCustomDNSReentersCooldownWhenRetryStillFails(t *testing.T) {
+	name, err := dnsmessage.NewName("example.com.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	queryMessage := dnsmessage.Message{
+		Header:    dnsmessage.Header{ID: 8, RecursionDesired: true},
+		Questions: []dnsmessage.Question{{Name: name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}},
+	}
+	query, err := queryMessage.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var dialCount atomic.Int32
+	failing := dialerFunc(func(context.Context, string, string) (net.Conn, error) {
+		dialCount.Add(1)
+		return nil, errors.New("上游仍然不可达")
+	})
+	cache := newDNSNameCache()
+	resolver := newCustomDNSResolver(failing, "9.9.9.9:53", newFakeDNSResolver(cache), cache, slog.Default())
+	defer resolver.close()
+
+	// 模拟上一轮冷却期已结束。
+	resolver.unavailableSince.Store(time.Now().Add(-customDNSRetryInterval).UnixNano())
+	fallback, err := resolver.resolve(context.Background(), query)
+	if err != nil {
+		t.Fatalf("冷却后重试失败也应回退到 Fake-IP：%v", err)
+	}
+	var unpacked dnsmessage.Message
+	if err := unpacked.Unpack(fallback); err != nil {
+		t.Fatal(err)
+	}
+	if len(unpacked.Answers) != 1 {
+		t.Fatalf("回退应答数量为 %d", len(unpacked.Answers))
+	}
+	if body, ok := unpacked.Answers[0].Body.(*dnsmessage.AResource); !ok || !isFakeAddress(netip.AddrFrom4(body.A)) {
+		t.Fatalf("回退应答不是 Fake-IP：%v", unpacked.Answers)
+	}
+	if !resolver.inCooldown() {
+		t.Fatal("冷却后重试仍失败时应重新进入冷却期")
+	}
+	dialsAfterRetry := dialCount.Load()
+	if dialsAfterRetry == 0 {
+		t.Fatal("冷却到期后的首次请求应尝试连接上游")
+	}
+
+	// 新冷却期内：后续请求不应再触碰上游。
+	if _, err := resolver.resolve(context.Background(), query); err != nil {
+		t.Fatalf("新冷却期内回退失败：%v", err)
+	}
+	if dialCount.Load() != dialsAfterRetry {
+		t.Fatalf("重新进入冷却期后不应再次拨号上游，拨号次数由 %d 增至 %d", dialsAfterRetry, dialCount.Load())
 	}
 }

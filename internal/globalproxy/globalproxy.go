@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 
+	"sshvpn/internal/config"
 	"sshvpn/internal/stats"
 )
 
@@ -18,15 +19,18 @@ type Dialer interface {
 // Controller 管理虚拟网卡、临时路由和用户态网络栈的生命周期。
 type Controller interface {
 	Start(ctx context.Context) error
+	UpdateProcessRules(rules []config.ProcessRule) int
 	Close() error
 }
 
-// Options 汇总启动全局模式所需的内部对象和已校验设置。
+// Options 汇总启动全局/进程分流模式所需的内部对象和已校验设置。
 type Options struct {
-	SSHServerIP net.IP
-	Dialer      Dialer
-	DNSServer   string
-	Logger      *slog.Logger
-	// Traffic 接收全局转发流量的统计对象；为 nil 时自动创建。
+	SSHServerIP  net.IP
+	Dialer       Dialer
+	DNSServer    string
+	Logger       *slog.Logger
+	Mode         config.ProxyMode
+	ProcessRules []config.ProcessRule
+	// Traffic 接收经 SSH 转发流量的统计对象；为 nil 时自动创建。
 	Traffic *stats.Traffic
 }

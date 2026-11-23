@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+
+	"sshvpn/internal/config"
 )
 
 type unsupportedController struct{}
@@ -16,6 +18,8 @@ func New(Options) Controller { return unsupportedController{} }
 func (unsupportedController) Start(context.Context) error {
 	return errors.New("全局模式目前只支持 Windows")
 }
+
+func (unsupportedController) UpdateProcessRules([]config.ProcessRule) int { return 0 }
 
 func (unsupportedController) Close() error { return nil }
 
