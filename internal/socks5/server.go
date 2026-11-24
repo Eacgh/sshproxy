@@ -332,6 +332,8 @@ func classifyDialError(err error) byte {
 
 // proxy 同时复制两个方向的数据，并在单向结束时发送半关闭信号。
 // 复制过程中统计实际转发的用户流量字节数。
+var socksHalfCloseTimeout = 15 * time.Second
+
 func (s *Server) proxy(client, remote net.Conn) {
 	done := make(chan struct{}, 2)
 	copyOneWay := func(dst, src net.Conn, upload bool) {
@@ -340,12 +342,21 @@ func (s *Server) proxy(client, remote net.Conn) {
 		if closeWriter, ok := dst.(interface{ CloseWrite() error }); ok {
 			_ = closeWriter.CloseWrite()
 		}
+		_ = dst.SetReadDeadline(time.Now().Add(socksHalfCloseTimeout))
 		done <- struct{}{}
 	}
 	go copyOneWay(remote, client, true)  // 本机 -> 远端：上行
 	go copyOneWay(client, remote, false) // 远端 -> 本机：下行
 	<-done
-	<-done
+	timer := time.NewTimer(socksHalfCloseTimeout)
+	select {
+	case <-done:
+		timer.Stop()
+	case <-timer.C:
+		_ = client.Close()
+		_ = remote.Close()
+		<-done
+	}
 }
 
 // Close 停止监听，同时关闭客户端和 SSH 远端连接，并等待处理协程退出。

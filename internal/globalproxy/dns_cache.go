@@ -6,6 +6,8 @@ import (
 	"time"
 )
 
+const maxDNSCacheEntries = 2048
+
 type dnsNameEntry struct {
 	name          string
 	connectTarget netip.Addr
@@ -19,11 +21,13 @@ type dnsNameCache struct {
 }
 
 func (c *dnsNameCache) storeResolved(name string, fakeAddress, connectTarget netip.Addr, ttl time.Duration) {
+	now := time.Now()
 	c.mu.Lock()
+	c.pruneExpiredLocked(now)
 	c.entries[fakeAddress.Unmap()] = dnsNameEntry{
 		name:          name,
 		connectTarget: connectTarget.Unmap(),
-		expiresAt:     time.Now().Add(ttl),
+		expiresAt:     now.Add(ttl),
 	}
 	c.mu.Unlock()
 }
@@ -33,12 +37,25 @@ func newDNSNameCache() *dnsNameCache {
 }
 
 func (c *dnsNameCache) store(name string, address netip.Addr, ttl time.Duration) {
+	now := time.Now()
 	c.mu.Lock()
+	c.pruneExpiredLocked(now)
 	c.entries[address.Unmap()] = dnsNameEntry{
 		name:      name,
-		expiresAt: time.Now().Add(ttl),
+		expiresAt: now.Add(ttl),
 	}
 	c.mu.Unlock()
+}
+
+func (c *dnsNameCache) pruneExpiredLocked(now time.Time) {
+	if len(c.entries) < maxDNSCacheEntries {
+		return
+	}
+	for k, entry := range c.entries {
+		if !now.Before(entry.expiresAt) {
+			delete(c.entries, k)
+		}
+	}
 }
 
 func (c *dnsNameCache) lookupTarget(address netip.Addr) (string, netip.Addr, bool) {

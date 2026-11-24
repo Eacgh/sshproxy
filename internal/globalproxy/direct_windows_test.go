@@ -4,6 +4,7 @@ package globalproxy
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -82,5 +83,39 @@ func TestWindowsDirectDialerResolveIPv4WithLocalMockDNS(t *testing.T) {
 	}
 	if resolved != netip.MustParseAddr("110.242.68.66") {
 		t.Fatalf("ResolveIPv4() = %s，期望 110.242.68.66", resolved)
+	}
+}
+
+func TestWindowsDirectDialerRejectsIPv6WithoutPhysicalIndexAndTracksUDPPorts(t *testing.T) {
+	dialer := newWindowsDirectDialer(0, 0, nil, slog.Default())
+	if _, err := dialer.ListenUDP(true); !errors.Is(err, errNoDirectIPv6) {
+		t.Fatalf("无 IPv6 物理网卡时 ListenUDP(true) 返回 %v，期望 errNoDirectIPv6", err)
+	}
+	if _, err := dialer.DialTCP(context.Background(), "[2408:8726:2000:6::132]:443"); !errors.Is(err, errNoDirectIPv6) {
+		t.Fatalf("无 IPv6 物理网卡时 IPv6 DialTCP 返回 %v，期望 errNoDirectIPv6", err)
+	}
+
+	route, err := findDefaultIPv4Route()
+	if err != nil {
+		t.Skipf("当前环境没有可用的 IPv4 默认网关，跳过端口跟踪测试：%v", err)
+	}
+	v4Dialer := newWindowsDirectDialer(route.InterfaceIndex, 0, nil, slog.Default())
+	pc, err := v4Dialer.ListenUDP(false)
+	if err != nil {
+		t.Fatalf("ListenUDP(false) 失败：%v", err)
+	}
+	udpAddr, ok := pc.LocalAddr().(*net.UDPAddr)
+	if !ok || udpAddr.Port == 0 {
+		_ = pc.Close()
+		t.Fatalf("ListenUDP(false) 返回异常本地地址：%v", pc.LocalAddr())
+	}
+	port := uint16(udpAddr.Port)
+	if !v4Dialer.OwnsLocalUDPPort(false, port) {
+		_ = pc.Close()
+		t.Fatalf("ListenUDP 打开后 OwnsLocalUDPPort(false, %d) 应为 true", port)
+	}
+	_ = pc.Close()
+	if v4Dialer.OwnsLocalUDPPort(false, port) {
+		t.Fatalf("Close() 后 OwnsLocalUDPPort(false, %d) 应清除为 false", port)
 	}
 }

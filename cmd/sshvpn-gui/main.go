@@ -3,7 +3,9 @@ package main
 import (
 	"embed"
 	"io/fs"
+	"math"
 	"os"
+	"runtime/debug"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
@@ -15,6 +17,10 @@ import (
 var frontendEmbed embed.FS
 
 func main() {
+	if debug.SetMemoryLimit(-1) == math.MaxInt64 {
+		debug.SetMemoryLimit(256 << 20)
+	}
+
 	frontendFS, err := fs.Sub(frontendEmbed, "frontend")
 	if err != nil {
 		println("加载前端资源失败:", err.Error())

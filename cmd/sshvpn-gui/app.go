@@ -40,6 +40,12 @@ type ProcessRulesUpdateResult struct {
 	ClosedConnections int                  `json:"closed_connections"`
 }
 
+// LiveSnapshot 包含主窗口从托盘恢复显示时同步状态与日志缓存所需的轻量数据。
+type LiveSnapshot struct {
+	Status core.StatusSnapshot `json:"status"`
+	Logs   []string            `json:"logs"`
+}
+
 // App 是 Wails 后端控制器，向前端暴露绑定方法并协调引擎与系统托盘。
 type App struct {
 	baseDir       string
@@ -51,6 +57,7 @@ type App struct {
 
 	ctx           context.Context
 	exitRequested atomic.Bool
+	windowHidden  atomic.Bool
 	shutdownOnce  sync.Once
 
 	storeMu     sync.Mutex
@@ -111,12 +118,14 @@ func (a *App) OnBeforeClose(ctx context.Context) bool {
 	if a.exitRequested.Load() {
 		return false
 	}
+	a.windowHidden.Store(true)
 	wailsruntime.WindowHide(ctx)
 	return true
 }
 
 // OnShutdown 在应用退出前安全停止代理（清理 Wintun 路由并保存流量）并移除托盘图标。
 func (a *App) OnShutdown(context.Context) {
+	a.windowHidden.Store(true)
 	a.shutdownOnce.Do(func() {
 		_ = a.engine.Stop()
 		if a.tray != nil {
@@ -125,13 +134,15 @@ func (a *App) OnShutdown(context.Context) {
 	})
 }
 
-// ShowWindow 从托盘或单实例唤醒主窗口。
+// ShowWindow 从托盘或单实例唤醒主窗口，并通知前端同步隐藏期间错过的状态与日志。
 func (a *App) ShowWindow() {
 	if a.ctx == nil {
 		return
 	}
+	a.windowHidden.Store(false)
 	wailsruntime.WindowShow(a.ctx)
 	wailsruntime.WindowUnminimise(a.ctx)
+	wailsruntime.EventsEmit(a.ctx, "sync")
 }
 
 // QuitApp 停止代理、移除托盘并退出程序。
@@ -139,6 +150,7 @@ func (a *App) QuitApp() {
 	if !a.exitRequested.CompareAndSwap(false, true) {
 		return
 	}
+	a.windowHidden.Store(true)
 	if a.ctx != nil {
 		wailsruntime.WindowHide(a.ctx)
 	}
@@ -148,6 +160,20 @@ func (a *App) QuitApp() {
 	}
 	if a.ctx != nil {
 		wailsruntime.Quit(a.ctx)
+	}
+}
+
+// GetLiveSnapshot 返回当前连接状态与内存日志缓存，供托盘恢复显示时增量同步。
+func (a *App) GetLiveSnapshot() LiveSnapshot {
+	a.mu.Lock()
+	logsCopy := append([]string(nil), a.logs...)
+	a.mu.Unlock()
+	if logsCopy == nil {
+		logsCopy = []string{}
+	}
+	return LiveSnapshot{
+		Status: a.engine.Status(),
+		Logs:   logsCopy,
 	}
 }
 
@@ -456,7 +482,7 @@ func (a *App) handleLog(line string) {
 	}
 	a.mu.Unlock()
 
-	if a.ctx != nil {
+	if a.ctx != nil && !a.windowHidden.Load() {
 		wailsruntime.EventsEmit(a.ctx, "log", line)
 	}
 }
@@ -469,7 +495,7 @@ func (a *App) handleState(status core.StatusSnapshot) {
 }
 
 func (a *App) handleTraffic(upload, download uint64) {
-	if a.ctx != nil {
+	if a.ctx != nil && !a.windowHidden.Load() {
 		wailsruntime.EventsEmit(a.ctx, "traffic", map[string]uint64{
 			"upload":   upload,
 			"download": download,

@@ -25,15 +25,49 @@ import (
 const (
 	// 建连超时要覆盖 SSH 通道建立、服务器端解析域名和连接目标的完整过程；
 	// 太短会把慢链路误判为不可达并触发熔断，导致页面整体不可用。
-	tcpDialTimeout   = 15 * time.Second
-	tcpHalfCloseTime = 60 * time.Second
-	tcpRelayBuffer   = 128 << 10
-	udpRelayBuffer   = (1 << 16) - 1
-	dialLogInterval  = 10 * time.Second
+	tcpDialTimeout    = 15 * time.Second
+	tcpHalfCloseTime  = 15 * time.Second
+	tcpRelayBuffer    = 32 << 10
+	udpRelayBuffer    = 16 << 10
+	udpIdleTimeout    = 30 * time.Second
+	dialLogInterval   = 10 * time.Second
+	maxDirectUDPFlows = 512
 )
 
-var tcpBufferPool = sync.Pool{New: func() any { return make([]byte, tcpRelayBuffer) }}
-var udpBufferPool = sync.Pool{New: func() any { return make([]byte, udpRelayBuffer) }}
+var (
+	tcpHalfCloseTimeout = tcpHalfCloseTime
+	tcpBufferPool       = sync.Pool{New: func() any { return make([]byte, tcpRelayBuffer) }}
+	udpBufferPool       = sync.Pool{New: func() any { return make([]byte, udpRelayBuffer) }}
+	wintunIPv4Prefix    = netip.MustParsePrefix("198.18.0.0/24")
+	wintunIPv6Addr      = netip.MustParseAddr("fd00::1")
+	wintunDNSIPv6Addr   = netip.MustParseAddr("fd00::2")
+)
+
+type flowRoute uint8
+
+const (
+	flowRouteDirect flowRoute = iota
+	flowRouteProxy
+	flowRouteDrop
+)
+
+type localPortOwner interface {
+	OwnsLocalUDPPort(ipv6 bool, port uint16) bool
+}
+
+// isNonForwardableDirectDest 过滤不可通过物理网卡直连转发的目标地址，
+// 防止发往 Wintun 网段/网关或二层多播/广播的流量再次回灌入虚拟网卡形成回环。
+func isNonForwardableDirectDest(addr netip.Addr) bool {
+	addr = addr.Unmap()
+	if !addr.IsValid() || addr.IsUnspecified() || addr.IsLoopback() ||
+		addr.IsMulticast() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() {
+		return true
+	}
+	if addr.Is4() {
+		return addr == netip.AddrFrom4([4]byte{255, 255, 255, 255}) || wintunIPv4Prefix.Contains(addr)
+	}
+	return addr == wintunIPv6Addr || addr == wintunDNSIPv6Addr
+}
 
 type dialLogState struct {
 	lastLogged time.Time
@@ -93,14 +127,15 @@ type trackedFlow struct {
 // 相比通用处理器，它移除了逐次读写的统计原子操作，并使用更大的复制缓冲区减少 SSH 包装调用；
 // 在按进程分流模式下支持依据源端口反查进程并将非目标流量直连物理网卡。
 type fastTransportHandler struct {
-	transport *sshTransport
-	logger    *slog.Logger
-	stats     *stats.Traffic
-	mode      config.ProxyMode
-	matcher   *ProcessMatcher
-	lookup    processLookup
-	direct    directTransport
-	selfPID   uint32
+	transport      *sshTransport
+	logger         *slog.Logger
+	stats          *stats.Traffic
+	mode           config.ProxyMode
+	matcher        *ProcessMatcher
+	lookup         processLookup
+	direct         directTransport
+	selfPID        uint32
+	directUDPSlots chan struct{}
 
 	mu     sync.Mutex
 	flows  map[*trackedFlow]struct{}
@@ -139,16 +174,17 @@ func newFastTransportHandlerWithConfig(cfg fastTransportConfig) *fastTransportHa
 		mode = config.ModeGlobal
 	}
 	return &fastTransportHandler{
-		transport: newSSHTransport(cfg.dialer, cfg.dnsServer, logger),
-		logger:    logger,
-		stats:     traffic,
-		mode:      mode,
-		matcher:   NewProcessMatcher(cfg.processRules),
-		lookup:    cfg.lookup,
-		direct:    cfg.direct,
-		selfPID:   uint32(os.Getpid()),
-		flows:     make(map[*trackedFlow]struct{}),
-		dialLogs:  make(map[string]dialLogState),
+		transport:      newSSHTransport(cfg.dialer, cfg.dnsServer, logger),
+		logger:         logger,
+		stats:          traffic,
+		mode:           mode,
+		matcher:        NewProcessMatcher(cfg.processRules),
+		lookup:         cfg.lookup,
+		direct:         cfg.direct,
+		selfPID:        uint32(os.Getpid()),
+		directUDPSlots: make(chan struct{}, maxDirectUDPFlows),
+		flows:          make(map[*trackedFlow]struct{}),
+		dialLogs:       make(map[string]dialLogState),
 	}
 }
 
@@ -217,11 +253,11 @@ func (h *fastTransportHandler) handleTCPFlow(flow *trackedFlow, origin adapter.T
 	}
 	if metadata.DstPort != 53 && h.mode == config.ModeProcess {
 		id, ok := h.lookupTCPProcess(metadata)
-		useProxy, matchedBy, aborted := h.classifyFlow(flow, id, ok)
-		if aborted {
+		route, matchedBy, aborted := h.classifyFlow(flow, id, ok)
+		if aborted || route == flowRouteDrop {
 			return
 		}
-		if !useProxy {
+		if route == flowRouteDirect {
 			h.handleDirectTCP(flow, origin, metadata, id.Path)
 			return
 		}
@@ -245,24 +281,29 @@ func (h *fastTransportHandler) lookupUDPProcess(metadata *M.Metadata) (ProcessId
 	return h.lookup.LookupUDP(metadata.SrcIP, metadata.SrcPort)
 }
 
-func (h *fastTransportHandler) classifyFlow(flow *trackedFlow, id ProcessIdentity, ok bool) (bool, string, bool) {
+func (h *fastTransportHandler) classifyFlow(flow *trackedFlow, id ProcessIdentity, ok bool) (flowRoute, string, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed || flow.aborted {
-		return false, "", true
+		return flowRouteDrop, "", true
+	}
+	if ok && id.PID == h.selfPID {
+		// 严禁把本进程自己发起的连接（例如直连套接字或 SSH）再经虚拟网卡回送，否则会形成自激放大回环。
+		flow.classified = false
+		return flowRouteDrop, "", false
 	}
 	flow.classified = true
 	if ok && id.PID != 0 {
 		flow.pid = id.PID
 		flow.paths = append([]string(nil), id.Paths...)
-		if id.PID != h.selfPID && h.matcher != nil {
+		if h.matcher != nil {
 			if matched, hit := h.matcher.MatchAny(id.Paths); hit {
 				flow.proxied = true
-				return true, matched, false
+				return flowRouteProxy, matched, false
 			}
 		}
 	}
-	return false, "", false
+	return flowRouteDirect, "", false
 }
 
 func (h *fastTransportHandler) handleProxyTCP(flow *trackedFlow, origin adapter.TCPConn, metadata *M.Metadata, processPath, matchedBy string) {
@@ -347,6 +388,9 @@ func (h *fastTransportHandler) handleDirectTCP(flow *trackedFlow, origin adapter
 		return
 	}
 	isFake := isFakeAddress(metadata.DstIP)
+	if !isFake && isNonForwardableDirectDest(metadata.DstIP) {
+		return
+	}
 	var initial []byte
 	var domain string
 	if mappedName, ok := h.transport.mappedServerName(metadata); ok {
@@ -384,12 +428,15 @@ func (h *fastTransportHandler) handleDirectTCP(flow *trackedFlow, origin adapter
 			}
 			return
 		}
+		if isNonForwardableDirectDest(resolvedIP) {
+			return
+		}
 		dialTarget = net.JoinHostPort(resolvedIP.String(), strconv.Itoa(int(metadata.DstPort)))
 	}
 
 	remote, err := h.direct.DialTCP(ctx, dialTarget)
 	if err != nil {
-		if flow.ctx.Err() == nil {
+		if flow.ctx.Err() == nil && !errors.Is(err, errNoDirectIPv6) && !errors.Is(err, errNoDirectIPv4) {
 			h.logger.Debug("直连 TCP 通道失败", "进程", processPath, "目标", dialTarget, "错误", err)
 		}
 		return
@@ -426,6 +473,13 @@ func writeAll(connection net.Conn, payload []byte) error {
 func (h *fastTransportHandler) logDialFailure(target string, err error) {
 	now := time.Now()
 	h.logMu.Lock()
+	if len(h.dialLogs) >= 256 {
+		for k, entry := range h.dialLogs {
+			if now.Sub(entry.lastLogged) > 5*time.Minute {
+				delete(h.dialLogs, k)
+			}
+		}
+	}
 	state := h.dialLogs[target]
 	if !state.lastLogged.IsZero() && now.Sub(state.lastLogged) < dialLogInterval {
 		state.suppressed++
@@ -473,7 +527,17 @@ func (h *fastTransportHandler) relayTCP(origin, remote net.Conn, traffic *stats.
 	go h.copyTCP(remote, origin, done, true, traffic)  // 本机 -> 远端：上行
 	go h.copyTCP(origin, remote, done, false, traffic) // 远端 -> 本机：下行
 	<-done
-	<-done
+	timer := time.NewTimer(tcpHalfCloseTimeout)
+	select {
+	case <-done:
+		timer.Stop()
+	case <-timer.C:
+		// 强制收尾半关闭超时：ssh.Channel 不支持 SetReadDeadline，
+		// 若远端对 CloseWrite 后长期不返回 EOF，超时直接关闭两端以释放协程和缓冲。
+		_ = origin.Close()
+		_ = remote.Close()
+		<-done
+	}
 }
 
 func (h *fastTransportHandler) copyTCP(destination, source net.Conn, done chan<- struct{}, upload bool, traffic *stats.Traffic) {
@@ -487,7 +551,7 @@ func (h *fastTransportHandler) copyTCP(destination, source net.Conn, done chan<-
 	if closeWriter, ok := destination.(interface{ CloseWrite() error }); ok {
 		_ = closeWriter.CloseWrite()
 	}
-	_ = destination.SetReadDeadline(time.Now().Add(tcpHalfCloseTime))
+	_ = destination.SetReadDeadline(time.Now().Add(tcpHalfCloseTimeout))
 }
 
 func (h *fastTransportHandler) HandleUDP(origin adapter.UDPConn) {
@@ -519,12 +583,15 @@ func (h *fastTransportHandler) handleUDPFlow(flow *trackedFlow, origin adapter.U
 		return
 	}
 	if metadata.DstPort != 53 && h.mode == config.ModeProcess {
-		id, ok := h.lookupUDPProcess(metadata)
-		useProxy, _, aborted := h.classifyFlow(flow, id, ok)
-		if aborted {
+		if owner, ok := h.direct.(localPortOwner); ok && owner.OwnsLocalUDPPort(metadata.SrcIP.Is6(), metadata.SrcPort) {
 			return
 		}
-		if useProxy {
+		id, ok := h.lookupUDPProcess(metadata)
+		route, _, aborted := h.classifyFlow(flow, id, ok)
+		if aborted || route == flowRouteDrop {
+			return
+		}
+		if route == flowRouteProxy {
 			h.logger.Debug("已阻止白名单进程的非 DNS UDP 流量，促使回退到 TCP", "进程", id.Path, "目标", metadata.DestinationAddress())
 			return
 		}
@@ -554,6 +621,17 @@ func (h *fastTransportHandler) handleDirectUDP(flow *trackedFlow, origin adapter
 		return
 	}
 	isFake := isFakeAddress(metadata.DstIP)
+	if !isFake && isNonForwardableDirectDest(metadata.DstIP) {
+		return
+	}
+	if h.directUDPSlots != nil {
+		select {
+		case h.directUDPSlots <- struct{}{}:
+			defer func() { <-h.directUDPSlots }()
+		default:
+			return
+		}
+	}
 	useIPv6 := metadata.DstIP.Is6()
 	var targetAddr *net.UDPAddr
 	if isFake {
@@ -570,6 +648,9 @@ func (h *fastTransportHandler) handleDirectUDP(flow *trackedFlow, origin adapter
 			}
 			return
 		}
+		if isNonForwardableDirectDest(resolvedIP) {
+			return
+		}
 		targetAddr = net.UDPAddrFromAddrPort(netip.AddrPortFrom(resolvedIP, metadata.DstPort))
 		useIPv6 = false
 	} else {
@@ -581,7 +662,9 @@ func (h *fastTransportHandler) handleDirectUDP(flow *trackedFlow, origin adapter
 
 	remote, err := h.direct.ListenUDP(useIPv6)
 	if err != nil {
-		h.logger.Debug("创建直连 UDP 套接字失败", "目标", targetAddr.String(), "错误", err)
+		if !errors.Is(err, errNoDirectIPv6) && !errors.Is(err, errNoDirectIPv4) {
+			h.logger.Debug("创建直连 UDP 套接字失败", "目标", targetAddr.String(), "错误", err)
+		}
 		return
 	}
 	if !h.attachRemote(flow, remote) {
@@ -612,7 +695,7 @@ func copyUDP(destination, source net.PacketConn, target net.Addr, done chan<- st
 	buffer := udpBufferPool.Get().([]byte)
 	defer udpBufferPool.Put(buffer)
 	for {
-		_ = source.SetReadDeadline(time.Now().Add(60 * time.Second))
+		_ = source.SetReadDeadline(time.Now().Add(udpIdleTimeout))
 		read, _, err := source.ReadFrom(buffer)
 		if err != nil {
 			return

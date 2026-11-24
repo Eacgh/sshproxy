@@ -4,11 +4,17 @@ package globalproxy
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net"
 
 	"sshvpn/internal/config"
 	"sshvpn/internal/stats"
+)
+
+var (
+	errNoDirectIPv4 = errors.New("缺少可用的 IPv4 物理出站网卡")
+	errNoDirectIPv6 = errors.New("缺少可用的 IPv6 物理出站网卡，已忽略 IPv6 直连以防回环")
 )
 
 // Dialer 是全局转发层访问 SSH direct-tcpip 的最小接口。

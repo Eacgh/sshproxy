@@ -4,9 +4,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"syscall"
 
 	"sshvpn/internal/config"
@@ -15,6 +17,9 @@ import (
 )
 
 func main() {
+	if debug.SetMemoryLimit(-1) == math.MaxInt64 {
+		debug.SetMemoryLimit(256 << 20)
+	}
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "sshvpn 运行失败：", err)
 		os.Exit(1)

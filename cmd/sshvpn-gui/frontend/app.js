@@ -100,6 +100,15 @@ function subscribeBackendEvents() {
       updateTrafficText(data.upload || 0, data.download || 0);
     }
   });
+  window.runtime.EventsOn('sync', async () => {
+    try {
+      const snap = await api().GetLiveSnapshot();
+      replaceAllLogs(snap.logs || []);
+      applyStatus(snap.status);
+    } catch (_) {
+      // 忽略窗口恢复时的瞬时同步异常
+    }
+  });
 }
 
 async function loadBootstrap() {
@@ -770,6 +779,22 @@ function appendLogLine(line, skipScroll = false) {
     if (container.firstChild) container.removeChild(container.firstChild);
   }
   if (!skipScroll) scrollLogsToBottom();
+}
+
+function replaceAllLogs(lines) {
+  state.logs = [];
+  const container = document.getElementById('logContainer');
+  container.innerHTML = '';
+  const frag = document.createDocumentFragment();
+  lines.slice(-1000).forEach((line) => {
+    state.logs.push(line);
+    const div = document.createElement('div');
+    div.className = 'log-line';
+    div.textContent = line;
+    frag.appendChild(div);
+  });
+  container.appendChild(frag);
+  scrollLogsToBottom();
 }
 
 function scrollLogsToBottom() {

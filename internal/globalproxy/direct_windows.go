@@ -52,6 +52,10 @@ type windowsDirectDialer struct {
 	queryID atomic.Uint32
 	mu      sync.Mutex
 	cache   map[string]directDNSCacheEntry
+
+	portMu      sync.Mutex
+	activeUDPv4 map[uint16]struct{}
+	activeUDPv6 map[uint16]struct{}
 }
 
 func newWindowsDirectDialer(ipv4Index, ipv6Index uint32, dnsAddrs []netip.Addr, logger *slog.Logger) *windowsDirectDialer {
@@ -74,12 +78,14 @@ func newWindowsDirectDialer(ipv4Index, ipv6Index uint32, dnsAddrs []netip.Addr, 
 		}
 	}
 	return &windowsDirectDialer{
-		ipv4Index:  ipv4Index,
-		ipv6Index:  ipv6Index,
-		dnsServers: servers,
-		logger:     logger,
-		control:    bindInterfaceControl(ipv4Index, ipv6Index),
-		cache:      make(map[string]directDNSCacheEntry),
+		ipv4Index:   ipv4Index,
+		ipv6Index:   ipv6Index,
+		dnsServers:  servers,
+		logger:      logger,
+		control:     bindInterfaceControl(ipv4Index, ipv6Index),
+		cache:       make(map[string]directDNSCacheEntry),
+		activeUDPv4: make(map[uint16]struct{}),
+		activeUDPv6: make(map[uint16]struct{}),
 	}
 }
 
@@ -112,6 +118,68 @@ func bindInterfaceControl(ipv4Index, ipv6Index uint32) func(string, string, sysc
 	}
 }
 
+func (d *windowsDirectDialer) OwnsLocalUDPPort(ipv6 bool, port uint16) bool {
+	if port == 0 {
+		return false
+	}
+	d.portMu.Lock()
+	defer d.portMu.Unlock()
+	if ipv6 {
+		_, ok := d.activeUDPv6[port]
+		return ok
+	}
+	_, ok := d.activeUDPv4[port]
+	return ok
+}
+
+func (d *windowsDirectDialer) trackUDPPort(ipv6 bool, port uint16) {
+	if port == 0 {
+		return
+	}
+	d.portMu.Lock()
+	if ipv6 {
+		if d.activeUDPv6 == nil {
+			d.activeUDPv6 = make(map[uint16]struct{})
+		}
+		d.activeUDPv6[port] = struct{}{}
+	} else {
+		if d.activeUDPv4 == nil {
+			d.activeUDPv4 = make(map[uint16]struct{})
+		}
+		d.activeUDPv4[port] = struct{}{}
+	}
+	d.portMu.Unlock()
+}
+
+func (d *windowsDirectDialer) releaseUDPPort(ipv6 bool, port uint16) {
+	if port == 0 {
+		return
+	}
+	d.portMu.Lock()
+	if ipv6 {
+		delete(d.activeUDPv6, port)
+	} else {
+		delete(d.activeUDPv4, port)
+	}
+	d.portMu.Unlock()
+}
+
+type trackedPacketConn struct {
+	net.PacketConn
+	closeOnce sync.Once
+	onClose   func()
+}
+
+func (c *trackedPacketConn) Close() error {
+	err := c.PacketConn.Close()
+	c.closeOnce.Do(func() {
+		if c.onClose != nil {
+			c.onClose()
+		}
+	})
+	return err
+}
+
 func (d *windowsDirectDialer) DialTCP(ctx context.Context, address string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
@@ -126,6 +194,12 @@ func (d *windowsDirectDialer) DialTCP(ctx context.Context, address string) (net.
 		ip = resolved
 	}
 	ip = ip.Unmap()
+	if ip.Is6() && !ip.IsLoopback() && d.ipv6Index == 0 {
+		return nil, errNoDirectIPv6
+	}
+	if ip.Is4() && !ip.IsLoopback() && d.ipv4Index == 0 {
+		return nil, errNoDirectIPv4
+	}
 	network := "tcp4"
 	if ip.Is6() {
 		network = "tcp6"
@@ -138,12 +212,32 @@ func (d *windowsDirectDialer) DialTCP(ctx context.Context, address string) (net.
 }
 
 func (d *windowsDirectDialer) ListenUDP(ipv6 bool) (net.PacketConn, error) {
+	if ipv6 && d.ipv6Index == 0 {
+		return nil, errNoDirectIPv6
+	}
+	if !ipv6 && d.ipv4Index == 0 {
+		return nil, errNoDirectIPv4
+	}
 	network, bindAddr := "udp4", "0.0.0.0:0"
 	if ipv6 {
 		network, bindAddr = "udp6", "[::]:0"
 	}
 	lc := net.ListenConfig{Control: d.control}
-	return lc.ListenPacket(context.Background(), network, bindAddr)
+	conn, err := lc.ListenPacket(context.Background(), network, bindAddr)
+	if err != nil {
+		return nil, err
+	}
+	if udpAddr, ok := conn.LocalAddr().(*net.UDPAddr); ok && udpAddr.Port > 0 && udpAddr.Port <= 65535 {
+		port := uint16(udpAddr.Port)
+		d.trackUDPPort(ipv6, port)
+		return &trackedPacketConn{
+			PacketConn: conn,
+			onClose: func() {
+				d.releaseUDPPort(ipv6, port)
+			},
+		}, nil
+	}
+	return conn, nil
 }
 
 func (d *windowsDirectDialer) ResolveIPv4(ctx context.Context, host string) (netip.Addr, error) {
@@ -195,10 +289,21 @@ func (d *windowsDirectDialer) ResolveIPv4(ctx context.Context, host string) (net
 			lastErr = err
 			continue
 		}
+		now := time.Now()
 		d.mu.Lock()
+		if len(d.cache) >= 512 {
+			for k, v := range d.cache {
+				if !now.Before(v.expiresAt) {
+					delete(d.cache, k)
+				}
+			}
+			if len(d.cache) >= 2048 {
+				clear(d.cache)
+			}
+		}
 		d.cache[name] = directDNSCacheEntry{
 			addr:      addr,
-			expiresAt: time.Now().Add(ttl),
+			expiresAt: now.Add(ttl),
 		}
 		d.mu.Unlock()
 		return addr, nil

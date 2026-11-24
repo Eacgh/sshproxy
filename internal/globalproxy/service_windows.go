@@ -10,6 +10,7 @@ import (
 	"log"
 	"log/slog"
 	"runtime"
+	"runtime/debug"
 	"sync"
 
 	"github.com/xjasonlyu/tun2socks/v2/core"
@@ -113,11 +114,13 @@ func (c *windowsController) Start(ctx context.Context) error {
 	networkStack, err := core.CreateStack(&core.Config{
 		LinkEndpoint:     device,
 		TransportHandler: transport,
-		// 使用 tun2socks 官方默认栈配置（reno 拥塞控制、关闭 Nagle、
-		// 开启 SACK、缓冲区 4K-4M 范围）。手写参数中 cubic 在 gvisor 的
-		// 高延迟链路上会吞吐停滞，官方默认配置经过生产验证。
+		// 使用 tun2socks 官方默认栈配置（reno 拥塞控制、关闭 Nagle、开启 SACK），
+		// 并收紧每条连接 TCP 收发默认/上限缓冲（默认 256 KiB、上限 1 MiB），
+		// 避免海量并发连接时 gVisor 缓冲区长期占用数 GB 堆内存。
 		Options: []option.Option{
 			option.WithDefault(),
+			option.WithTCPSendBufferSizeRange(4<<10, 256<<10, 1<<20),
+			option.WithTCPReceiveBufferSizeRange(4<<10, 256<<10, 1<<20),
 		},
 	})
 	if err != nil {
@@ -158,7 +161,7 @@ func (c *windowsController) Start(ctx context.Context) error {
 			"虚拟网卡", adapterName,
 			"MTU", tunnelMTU,
 			"TCP缓冲", "系统默认",
-			"中继缓冲", "128 KiB",
+			"中继缓冲", "32 KiB",
 			"域名解析", dnsMode,
 			"建连保护", "同目标限流和超时熔断",
 		)
@@ -229,6 +232,7 @@ func (c *windowsController) Close() error {
 		c.stack.Close()
 		c.stack.Wait()
 	}
+	debug.FreeOSMemory()
 	c.options.Logger.Info("全局 TCP 代理已停止，临时路由已经清理")
 	return errors.Join(errs...)
 }

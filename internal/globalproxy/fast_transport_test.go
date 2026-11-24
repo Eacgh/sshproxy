@@ -3,10 +3,12 @@ package globalproxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -233,9 +235,14 @@ type stubDirectTransport struct {
 	mu           sync.Mutex
 	dialed       []string
 	resolved     map[string]netip.Addr
+	ownedUDPPorts map[uint16]bool
 	onDialTCP    func(ctx context.Context, address string) (net.Conn, error)
 	onListenUDP  func(ipv6 bool) (net.PacketConn, error)
 	listenCalled int
+}
+
+func (s *stubDirectTransport) OwnsLocalUDPPort(_ bool, port uint16) bool {
+	return s.ownedUDPPorts[port]
 }
 
 func (s *stubDirectTransport) DialTCP(ctx context.Context, address string) (net.Conn, error) {
@@ -981,4 +988,285 @@ func TestCloseCancelsInFlightDialImmediately(t *testing.T) {
 	case <-time.After(1 * time.Second):
 		t.Fatal("Close() 未能立即取消阻塞中的拨号并退出")
 	}
+}
+
+func TestModeProcessDropsSelfPIDTraffic(t *testing.T) {
+	selfPID := uint32(os.Getpid())
+	lookup := &stubProcessLookup{
+		tcp: map[uint16]ProcessIdentity{
+			53001: {
+				PID:   selfPID,
+				Path:  `D:\SSHVPN\SshVpn.exe`,
+				Paths: []string{`D:\SSHVPN\SshVpn.exe`},
+			},
+		},
+		udp: map[uint16]ProcessIdentity{
+			53002: {
+				PID:   selfPID,
+				Path:  `D:\SSHVPN\SshVpn.exe`,
+				Paths: []string{`D:\SSHVPN\SshVpn.exe`},
+			},
+		},
+	}
+	direct := &stubDirectTransport{
+		onDialTCP: func(context.Context, string) (net.Conn, error) {
+			t.Fatal("本进程自身的 TCP 不应被直连旁路再次拨号")
+			return nil, errors.New("unexpected dial")
+		},
+		onListenUDP: func(bool) (net.PacketConn, error) {
+			t.Fatal("本进程自身的 UDP 不应打开直连套接字")
+			return nil, errors.New("unexpected listen")
+		},
+	}
+	handler := newFastTransportHandlerWithConfig(fastTransportConfig{
+		dialer: dialerFunc(func(context.Context, string, string) (net.Conn, error) {
+			t.Fatal("本进程自身的流量不应走 SSH")
+			return nil, errors.New("unexpected ssh dial")
+		}),
+		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		mode:         config.ModeProcess,
+		processRules: []config.ProcessRule{{Name: "SshVpn.exe"}},
+		lookup:       lookup,
+		direct:       direct,
+	})
+	defer handler.Close()
+
+	client, tunnel := net.Pipe()
+	defer client.Close()
+	tcpConn := &stubTCPConn{
+		Conn: tunnel,
+		id: &stack.TransportEndpointID{
+			RemoteAddress: tcpip.AddrFrom4([4]byte{198, 18, 0, 1}),
+			RemotePort:    53001,
+			LocalAddress:  tcpip.AddrFrom4([4]byte{203, 0, 113, 10}),
+			LocalPort:     443,
+		},
+	}
+	handler.handleTCP(tcpConn)
+
+	udpConn := newPipeUDPConn(&stack.TransportEndpointID{
+		RemoteAddress: tcpip.AddrFrom4([4]byte{198, 18, 0, 1}),
+		RemotePort:    53002,
+		LocalAddress:  tcpip.AddrFrom4([4]byte{203, 0, 113, 10}),
+		LocalPort:     443,
+	})
+	handler.handleUDP(udpConn)
+}
+
+func TestModeProcessDropsOwnedLocalUDPPort(t *testing.T) {
+	direct := &stubDirectTransport{
+		ownedUDPPorts: map[uint16]bool{54321: true},
+		onListenUDP: func(bool) (net.PacketConn, error) {
+			t.Fatal("属于本机已跟踪直连 UDP 端口的回环包不应再次打开套接字")
+			return nil, errors.New("unexpected listen")
+		},
+	}
+	handler := newFastTransportHandlerWithConfig(fastTransportConfig{
+		dialer: dialerFunc(func(context.Context, string, string) (net.Conn, error) {
+			t.Fatal("不应拨号 SSH")
+			return nil, nil
+		}),
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		mode:   config.ModeProcess,
+		lookup: &stubProcessLookup{},
+		direct: direct,
+	})
+	defer handler.Close()
+
+	udpConn := newPipeUDPConn(&stack.TransportEndpointID{
+		RemoteAddress: tcpip.AddrFrom4([4]byte{198, 18, 0, 1}),
+		RemotePort:    54321,
+		LocalAddress:  tcpip.AddrFrom4([4]byte{47, 239, 68, 171}),
+		LocalPort:     51820,
+	})
+	handler.handleUDP(udpConn)
+
+	direct.mu.Lock()
+	calls := direct.listenCalled
+	direct.mu.Unlock()
+	if calls != 0 {
+		t.Fatalf("ListenUDP 调用次数 = %d，期望 0", calls)
+	}
+}
+
+func TestModeProcessDropsNonForwardableDirectDestinations(t *testing.T) {
+	lookup := &stubProcessLookup{
+		tcp: map[uint16]ProcessIdentity{
+			55001: {PID: 2001, Path: `C:\Apps\app.exe`, Paths: []string{`C:\Apps\app.exe`}},
+		},
+		udp: map[uint16]ProcessIdentity{
+			55002: {PID: 2001, Path: `C:\Apps\app.exe`, Paths: []string{`C:\Apps\app.exe`}},
+		},
+	}
+	direct := &stubDirectTransport{
+		onDialTCP: func(_ context.Context, addr string) (net.Conn, error) {
+			if addr != "192.168.5.1:443" {
+				t.Fatalf("意外的直连 TCP 目标：%s", addr)
+			}
+			return startEchoPipe(), nil
+		},
+		onListenUDP: func(bool) (net.PacketConn, error) {
+			t.Fatal("不可直连转发的 UDP 目标不应打开套接字")
+			return nil, errors.New("unexpected listen")
+		},
+	}
+	handler := newFastTransportHandlerWithConfig(fastTransportConfig{
+		dialer: dialerFunc(func(context.Context, string, string) (net.Conn, error) {
+			t.Fatal("非白名单进程不应走 SSH")
+			return nil, nil
+		}),
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		mode:   config.ModeProcess,
+		lookup: lookup,
+		direct: direct,
+	})
+	defer handler.Close()
+
+	blockedV6 := tcpip.AddrFrom16([16]byte{0xfd, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1})
+	blockedDsts := []struct {
+		addr tcpip.Address
+		port uint16
+	}{
+		{blockedV6, 5351},
+		{tcpip.AddrFrom4([4]byte{198, 18, 0, 1}), 5351},
+		{tcpip.AddrFrom4([4]byte{224, 0, 0, 251}), 5353},
+		{tcpip.AddrFrom4([4]byte{255, 255, 255, 255}), 9999},
+	}
+	for _, item := range blockedDsts {
+		c, tunnel := net.Pipe()
+		handler.handleTCP(&stubTCPConn{
+			Conn: tunnel,
+			id: &stack.TransportEndpointID{
+				RemoteAddress: tcpip.AddrFrom4([4]byte{198, 18, 0, 1}),
+				RemotePort:    55001,
+				LocalAddress:  item.addr,
+				LocalPort:     item.port,
+			},
+		})
+		_ = c.Close()
+
+		u := newPipeUDPConn(&stack.TransportEndpointID{
+			RemoteAddress: tcpip.AddrFrom4([4]byte{198, 18, 0, 1}),
+			RemotePort:    55002,
+			LocalAddress:  item.addr,
+			LocalPort:     item.port,
+		})
+		handler.handleUDP(u)
+	}
+
+	// 普通局域网单播 192.168.5.1:443 必须仍允许直连。
+	lanClient, lanDone := openActiveEchoTCP(t, handler, 55001, [4]byte{192, 168, 5, 1}, "LAN-OK")
+	_ = lanClient.Close()
+	<-lanDone
+}
+
+type noDeadlineConn struct {
+	net.Conn
+}
+
+func (noDeadlineConn) SetReadDeadline(time.Time) error {
+	return errors.New("ssh: tcpChan: deadline not supported")
+}
+
+func (noDeadlineConn) SetDeadline(time.Time) error {
+	return errors.New("ssh: tcpChan: deadline not supported")
+}
+
+func TestRelayTCPForcesCloseOnHalfOpenRemoteWithoutDeadlineSupport(t *testing.T) {
+	origTimeout := tcpHalfCloseTimeout
+	tcpHalfCloseTimeout = 100 * time.Millisecond
+	defer func() { tcpHalfCloseTimeout = origTimeout }()
+
+	originClient, originTunnel := newDuplexPipe()
+	remoteTunnel, remoteServer := newDuplexPipe()
+	defer originClient.Close()
+	defer remoteServer.Close()
+
+	// 模拟远端 SSH 通道：不支持 SetReadDeadline，收到本地 CloseWrite 后既不回 EOF 也不关闭，
+	// 若无强制收尾计时器，relayTCP 会永久挂死并泄漏协程与缓冲区。
+	handler := newFastTransportHandlerWithStats(dialerFunc(func(context.Context, string, string) (net.Conn, error) {
+		return nil, nil
+	}), "", slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+
+	relayDone := make(chan struct{})
+	go func() {
+		handler.relayTCP(originTunnel, noDeadlineConn{Conn: remoteTunnel}, handler.stats)
+		close(relayDone)
+	}()
+
+	_ = originClient.Close()
+	// 丢弃 remoteServer 收到的半关闭信号但不关闭 remoteServer 写端，保持半开。
+	readBuf := make([]byte, 16)
+	_, _ = remoteServer.Read(readBuf)
+
+	select {
+	case <-relayDone:
+	case <-time.After(1 * time.Second):
+		t.Fatal("不支持 SetReadDeadline 的半开连接在超时后未能强制退出，存在永久泄漏风险")
+	}
+}
+
+func TestDirectUDPConcurrencyCap(t *testing.T) {
+	lookup := &stubProcessLookup{
+		udp: map[uint16]ProcessIdentity{
+			56001: {PID: 3001, Path: `C:\Apps\udp1.exe`, Paths: []string{`C:\Apps\udp1.exe`}},
+			56002: {PID: 3002, Path: `C:\Apps\udp2.exe`, Paths: []string{`C:\Apps\udp2.exe`}},
+		},
+	}
+	remoteUDP := newPipeUDPConn(&stack.TransportEndpointID{RemotePort: 443})
+	direct := &stubDirectTransport{
+		onListenUDP: func(bool) (net.PacketConn, error) {
+			return remoteUDP, nil
+		},
+	}
+	handler := newFastTransportHandlerWithConfig(fastTransportConfig{
+		dialer: dialerFunc(func(context.Context, string, string) (net.Conn, error) {
+			return nil, nil
+		}),
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		mode:   config.ModeProcess,
+		lookup: lookup,
+		direct: direct,
+	})
+	handler.directUDPSlots = make(chan struct{}, 1)
+	defer handler.Close()
+
+	u1 := newPipeUDPConn(&stack.TransportEndpointID{
+		RemoteAddress: tcpip.AddrFrom4([4]byte{198, 18, 0, 1}),
+		RemotePort:    56001,
+		LocalAddress:  tcpip.AddrFrom4([4]byte{203, 0, 113, 1}),
+		LocalPort:     443,
+	})
+	done1 := make(chan struct{})
+	go func() {
+		handler.handleUDP(u1)
+		close(done1)
+	}()
+
+	// 确认第一条已占用唯一并发槽位并完成转发。
+	u1.in <- []byte("FIRST")
+	select {
+	case <-remoteUDP.out:
+	case <-time.After(2 * time.Second):
+		t.Fatal("第一条直连 UDP 超时")
+	}
+
+	// 第二条并发直连 UDP 必须因并发上限被直接丢弃，不再调用 ListenUDP。
+	u2 := newPipeUDPConn(&stack.TransportEndpointID{
+		RemoteAddress: tcpip.AddrFrom4([4]byte{198, 18, 0, 1}),
+		RemotePort:    56002,
+		LocalAddress:  tcpip.AddrFrom4([4]byte{203, 0, 113, 2}),
+		LocalPort:     443,
+	})
+	handler.handleUDP(u2)
+
+	direct.mu.Lock()
+	calls := direct.listenCalled
+	direct.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("超过直连 UDP 并发上限后仍被调用 ListenUDP：calls=%d，期望 1", calls)
+	}
+
+	_ = u1.Close()
+	<-done1
 }
